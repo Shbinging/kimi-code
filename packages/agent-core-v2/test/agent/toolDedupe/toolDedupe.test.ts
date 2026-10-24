@@ -312,6 +312,22 @@ describe('AgentToolDedupeService', () => {
       expect(results.map((result) => result.result.output)).toEqual(['A', 'A']);
     });
 
+    it('executes same-step calls independently when a tool disables dedupe', async () => {
+      const h = createHarness();
+      const tool = new EchoTool('Bash') as EchoTool & { allowSameStepDedupe?: boolean };
+      tool.allowSameStepDedupe = false;
+      h.registry.register(tool);
+
+      const results = await runStep(h, 1, 1, [
+        toolCall('c1', 'Bash', { text: 'A' }),
+        toolCall('c2', 'Bash', { text: 'A' }),
+      ]);
+
+      expect(tool.calls).toHaveLength(2);
+      expect(tool.calls.map((call) => call.toolCallId)).toEqual(['c1', 'c2']);
+      expect(results.map((result) => result.result.output)).toEqual(['A', 'A']);
+    });
+
     it('wires through ToolExecutor hooks and replaces same-step placeholders', async () => {
       const h = createHarness();
       const tool = new EchoTool();

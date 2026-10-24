@@ -112,6 +112,32 @@ function agentTask(
   return task;
 }
 
+function deferredResult() {
+  let resolve!: (value: { result: string }) => void;
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<{ result: string }>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function registerBatchedAgent(
+  manager: IAgentTaskService,
+  completion: Promise<{ result: string }>,
+  description: string,
+  groupId: string,
+  timeoutMs = 5_000,
+): string {
+  return manager.registerTask(agentTask(completion, description), {
+    detached: false,
+    timeoutMs,
+    detachTimeoutMs: 0,
+    autoBackgroundOnTimeout: true,
+    notificationGroupId: groupId,
+  });
+}
+
 function persistedProcess(
   overrides: Partial<Extract<AgentTaskInfo, { kind: 'process' }>> = {},
 ): Extract<AgentTaskInfo, { kind: 'process' }> {
@@ -676,6 +702,346 @@ describe('AgentTaskService — notification delivery', () => {
       notificationId: `task:${taskId}:killed`,
     });
     expect(message.content[0]!.text).toContain('long shell task was stopped by user.');
+  });
+
+  it('bundles a dynamic batch and waits for late registration and every task', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { agent, ctx, manager } = createAgentTaskService();
+    const groupId = 'turn-1:call-1,call-2,call-3,call-4,call-5';
+    const completions = Array.from({ length: 5 }, () => deferredResult());
+    const ids = completions.slice(0, 4).map((completion, index) =>
+      registerBatchedAgent(manager, completion.promise, `batch task ${index}`, groupId),
+    );
+    const releases = ids.map((taskId) => manager.waitForForegroundRelease(taskId));
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(await Promise.all(releases)).toEqual(Array.from({ length: 4 }, () => 'timeout_detached'));
+    completions[0]!.resolve({ result: 'early result' });
+    await manager.wait(ids[0]!);
+    expect(notifiedCount(ctx)).toBe(0);
+
+    ids.push(registerBatchedAgent(manager, completions[4]!.promise, 'batch task 4', groupId));
+    const lateRelease = manager.waitForForegroundRelease(ids[4]!);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(lateRelease).resolves.toBe('timeout_detached');
+    manager.completeNotificationGroupRegistration(groupId);
+    vi.useRealTimers();
+
+    completions[1]!.resolve({ result: 'second result' });
+    await manager.wait(ids[1]!);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(notifiedCount(ctx)).toBe(0);
+
+    for (const index of [2, 3, 4]) {
+      completions[index]!.resolve({ result: `result ${index}` });
+    }
+    await Promise.all(ids.map((taskId) => manager.wait(taskId)));
+    await vi.waitFor(() => {
+      expect(notifiedCount(ctx)).toBe(1);
+    });
+    await drainNotifications(ctx);
+
+    const messages = ctx.context.get().filter(
+      (message) => message.origin?.kind === 'task' && message.origin.taskId === groupId,
+    );
+    expect(messages).toHaveLength(1);
+    const text = messages[0]!.content[0]!;
+    expect(text.type).toBe('text');
+    if (text.type !== 'text') return;
+    expect(text.text).toContain('type="task.batch_completed"');
+    expect(text.text).toContain('All 5 automatically backgrounded tasks completed.');
+    expect(text.text.match(/<task task_id=/g)).toHaveLength(5);
+    for (const [index, taskId] of ids.entries()) {
+      expect(text.text).toContain(`task_id="${taskId}"`);
+      expect(text.text).toContain(index === 0 ? 'early result' : index === 1 ? 'second result' : `result ${index}`);
+    }
+    expect(agent.context.appendUserMessage).toHaveBeenCalled();
+  });
+
+  it('waits for a whole dynamic batch and suppresses duplicate delivery after WaitFor', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { ctx, manager } = createAgentTaskService();
+    const groupId = 'turn-2:call-1,call-2';
+    const completions = [deferredResult(), deferredResult()];
+    let closeRegistration!: () => void;
+    const registrationCompletion = new Promise<void>((resolve) => {
+      closeRegistration = resolve;
+    });
+    const firstId = manager.registerTask(
+      agentTask(completions[0]!.promise, 'first batch task'),
+      {
+        detached: false,
+        timeoutMs: 5_000,
+        detachTimeoutMs: 0,
+        autoBackgroundOnTimeout: true,
+        notificationGroupId: groupId,
+        notificationGroupCompletion: registrationCompletion,
+      },
+    );
+    const firstRelease = manager.waitForForegroundRelease(firstId);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(firstRelease).resolves.toBe('timeout_detached');
+
+    const waiting = manager.waitForNotificationGroup(groupId, 20_000);
+    let settled = false;
+    void waiting.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    closeRegistration();
+    const secondId = manager.registerTask(
+      agentTask(completions[1]!.promise, 'second batch task'),
+      {
+        detached: false,
+        timeoutMs: 5_000,
+        detachTimeoutMs: 0,
+        autoBackgroundOnTimeout: true,
+        notificationGroupId: groupId,
+      },
+    );
+    const secondRelease = manager.waitForForegroundRelease(secondId);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(secondRelease).resolves.toBe('timeout_detached');
+
+    completions[0]!.resolve({ result: 'first result' });
+    await manager.wait(firstId);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    completions[1]!.resolve({ result: 'second result' });
+
+    const result = await waiting;
+    expect(result).toMatchObject({ complete: true });
+    expect(result?.tasks.map((info) => [info.taskId, info.status])).toEqual([
+      [firstId, 'completed'],
+      [secondId, 'completed'],
+    ]);
+    vi.useRealTimers();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(notifiedCount(ctx)).toBe(0);
+  });
+
+  it('interrupts a batch wait without stopping its tasks', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { manager } = createAgentTaskService();
+    const groupId = 'turn-2:call-abort';
+    const completion = deferredResult();
+    const taskId = registerBatchedAgent(manager, completion.promise, 'abortable batch task', groupId);
+    const release = manager.waitForForegroundRelease(taskId);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(release).resolves.toBe('timeout_detached');
+
+    const controller = new AbortController();
+    const waiting = manager.waitForNotificationGroup(groupId, 20_000, controller.signal);
+    controller.abort();
+    await expect(waiting).rejects.toThrow();
+    expect(manager.getTask(taskId)?.status).toBe('running');
+    completion.resolve({ result: 'still running after abort' });
+    await manager.wait(taskId);
+  });
+
+  it('sends one 30-second batch review with statuses and output, then waits for terminal state', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { agent, ctx, manager } = createAgentTaskService();
+    const groupId = 'turn-2:call-1,call-2';
+    const completions = [deferredResult(), deferredResult()];
+    const ids = completions.map((completion, index) =>
+      registerBatchedAgent(manager, completion.promise, `review task ${index}`, groupId),
+    );
+    const releases = ids.map((taskId) => manager.waitForForegroundRelease(taskId));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.all(releases);
+    manager.completeNotificationGroupRegistration(groupId);
+
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(notifiedCount(ctx)).toBe(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => {
+      expect(notifiedCount(ctx)).toBe(1);
+    });
+
+    const text = notificationMessageFor(agent, groupId).content[0]!.text;
+    expect(text).toContain('type="task.batch_review"');
+    expect(text).toContain('2 of 2 automatically backgrounded tasks are still running');
+    expect(text).toContain('This is the only scheduled progress review');
+    expect(text).toContain(`call WaitFor once with batch_id "${groupId}"`);
+    expect(text).toContain('do not create delay commands');
+    for (const taskId of ids) {
+      expect(text).toContain(`task_id="${taskId}" kind="agent" status="running"`);
+    }
+    expect(text).toContain('<output-preview');
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(notifiedCount(ctx)).toBe(1);
+    vi.useRealTimers();
+    completions[0]!.resolve({ result: 'review result 0' });
+    completions[1]!.resolve({ result: 'review result 1' });
+    await Promise.all(ids.map((taskId) => manager.wait(taskId)));
+    await vi.waitFor(() => {
+      expect(notifiedCount(ctx)).toBe(2);
+    });
+    await drainNotifications(ctx);
+  });
+
+  it('reports the first hard failure early and sends one final batch state', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { agent, ctx, manager } = createAgentTaskService();
+    const groupId = 'turn-3:call-1,call-2,call-3';
+    const completions = [deferredResult(), deferredResult(), deferredResult()];
+    const ids = completions.map((completion, index) =>
+      registerBatchedAgent(manager, completion.promise, `failure task ${index}`, groupId),
+    );
+    const releases = ids.map((taskId) => manager.waitForForegroundRelease(taskId));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.all(releases);
+    manager.completeNotificationGroupRegistration(groupId);
+    vi.useRealTimers();
+
+    completions[0]!.reject(new Error('first task crashed'));
+    await manager.wait(ids[0]!);
+    await vi.waitFor(() => {
+      expect(notifiedCount(ctx)).toBe(1);
+    });
+    await drainNotifications(ctx);
+    const failureText = notificationMessageFor(agent, groupId).content[0]!.text;
+    expect(failureText).toContain('type="task.batch_failed"');
+    expect(failureText).toContain('Title: Background batch failed');
+    expect(failureText).toContain('first task crashed');
+    expect(failureText).toContain(`task_id="${ids[1]}" kind="agent" status="running"`);
+    expect(failureText).toContain('final batch notification');
+
+    completions[1]!.reject(new Error('second task crashed'));
+    completions[2]!.resolve({ result: 'surviving result' });
+    await Promise.all(ids.map((taskId) => manager.wait(taskId)));
+    await vi.waitFor(() => {
+      expect(notifiedCount(ctx)).toBe(2);
+    });
+    await drainNotifications(ctx);
+
+    const messages = ctx.context.get().filter(
+      (message) => message.origin?.kind === 'task' && message.origin.taskId === groupId,
+    );
+    expect(messages).toHaveLength(2);
+    const finalText = messages[1]!.content[0]!;
+    expect(finalText.type).toBe('text');
+    if (finalText.type !== 'text') return;
+    expect(finalText.text).toContain('Title: Background batch finished with failures');
+    expect(finalText.text).toContain('2 did not complete successfully');
+    expect(finalText.text).toContain('second task crashed');
+    expect(finalText.text).toContain('surviving result');
+    expect(notifiedCount(ctx)).toBe(2);
+  });
+
+  it('falls back to individual delivery when a batch notification cannot be scheduled', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { agent, ctx, manager } = createAgentTaskService();
+    const groupId = 'turn-3:call-1,call-2';
+    const completions = [deferredResult(), deferredResult()];
+    const ids = completions.map((completion, index) =>
+      registerBatchedAgent(manager, completion.promise, `delivery task ${index}`, groupId),
+    );
+    const releases = ids.map((taskId) => manager.waitForForegroundRelease(taskId));
+    await vi.advanceTimersByTimeAsync(5_000);
+    await Promise.all(releases);
+    manager.completeNotificationGroupRegistration(groupId);
+    vi.useRealTimers();
+    const notify = vi.spyOn(ctx.get(IAgentLoopService), 'notify');
+    notify.mockImplementationOnce(() => {
+      throw new Error('injected notify failure');
+    });
+
+    completions[0]!.reject(new Error('first task crashed'));
+    await manager.wait(ids[0]!);
+    await vi.waitFor(() => {
+      const text = notificationMessageFor(agent, ids[0]!).content[0]!.text;
+      expect(text).toContain('type="task.failed"');
+      expect(text).toContain('first task crashed');
+    });
+
+    completions[1]!.resolve({ result: 'surviving result' });
+    await manager.wait(ids[1]!);
+    await vi.waitFor(() => {
+      const text = notificationMessageFor(agent, groupId).content[0]!.text;
+      expect(text).toContain('Title: Background batch finished with failures');
+      expect(text).toContain('surviving result');
+    });
+    await drainNotifications(ctx);
+    expect(notifiedCount(ctx)).toBe(2);
+  });
+
+  it('completes a batch when the last foreground task finishes without detaching', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const { agent, ctx, manager } = createAgentTaskService();
+    const groupId = 'turn-4:call-1,call-2';
+    const detachedCompletion = deferredResult();
+    const foregroundCompletion = deferredResult();
+    const detachedId = registerBatchedAgent(
+      manager,
+      detachedCompletion.promise,
+      'detached task',
+      groupId,
+    );
+    const foregroundId = registerBatchedAgent(
+      manager,
+      foregroundCompletion.promise,
+      'foreground task',
+      groupId,
+      60_000,
+    );
+    const release = manager.waitForForegroundRelease(detachedId);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(release).resolves.toBe('timeout_detached');
+    manager.completeNotificationGroupRegistration(groupId);
+
+    detachedCompletion.resolve({ result: 'detached result' });
+    await manager.wait(detachedId);
+    expect(notifiedCount(ctx)).toBe(0);
+    foregroundCompletion.resolve({ result: 'foreground result' });
+    await manager.wait(foregroundId);
+    vi.useRealTimers();
+    await vi.waitFor(() => {
+      expect(notifiedCount(ctx)).toBe(1);
+    });
+    await drainNotifications(ctx);
+
+    const text = notificationMessageFor(agent, groupId).content[0]!.text;
+    expect(text).toContain(`task_id="${detachedId}"`);
+    expect(text).toContain('detached result');
+    expect(text).not.toContain(`task_id="${foregroundId}"`);
+    expect(text).not.toContain('foreground result');
+  });
+
+  it('keeps explicit background tasks on individual completion notifications', async () => {
+    const { agent, ctx, manager } = createAgentTaskService();
+    const groupId = 'turn-5:call-1,call-2';
+    const firstId = manager.registerTask(
+      agentTask(Promise.resolve({ result: 'explicit one' }), 'explicit one'),
+      { detached: true, autoBackgroundOnTimeout: true, notificationGroupId: groupId },
+    );
+    const secondId = manager.registerTask(
+      agentTask(Promise.resolve({ result: 'explicit two' }), 'explicit two'),
+      { detached: true, autoBackgroundOnTimeout: true, notificationGroupId: groupId },
+    );
+    manager.completeNotificationGroupRegistration(groupId);
+
+    await Promise.all([manager.wait(firstId), manager.wait(secondId)]);
+    await vi.waitFor(() => {
+      expect(notifiedCount(ctx)).toBe(2);
+    });
+    await drainNotifications(ctx);
+
+    expect(notificationMessageFor(agent, firstId).content[0]!.text).toContain(
+      'Background agent completed',
+    );
+    expect(notificationMessageFor(agent, secondId).content[0]!.text).toContain(
+      'Background agent completed',
+    );
+    expect(
+      ctx.context.get().filter(
+        (message) => message.origin?.kind === 'task' && message.origin.taskId === groupId,
+      ),
+    ).toEqual([]);
   });
 
   it('TaskStopTool suppresses the real terminal notification for model-requested stops', async () => {

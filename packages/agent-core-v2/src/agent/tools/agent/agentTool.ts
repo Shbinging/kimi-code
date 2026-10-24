@@ -110,6 +110,7 @@ function isToolNamePattern(name: string): boolean {
 export class SubagentTool implements ISubagentTool {
   declare readonly _serviceBrand: undefined;
   readonly name: string = 'Agent';
+  readonly allowSameStepDedupe = false;
 
   get parameters(): Record<string, unknown> {
     const parameters = exposesSubagentModelChoice(this.config)
@@ -154,10 +155,25 @@ export class SubagentTool implements ISubagentTool {
     });
   }
 
+  private autoBackgroundOnTimeout(): boolean {
+    if (!this.canRunInBackground()) return false;
+    const timeoutMs = resolveSubagentTimeoutMs(this.config);
+    const autoBackgroundAfterMs = resolveSubagentAutoBackgroundAfterMs(this.config);
+    return (
+      autoBackgroundAfterMs > 0 &&
+      (timeoutMs === 0 || autoBackgroundAfterMs < timeoutMs)
+    );
+  }
+
   get description(): string {
-    const backgroundDescription = this.canRunInBackground()
-      ? AGENT_BACKGROUND_DESCRIPTION
-      : AGENT_BACKGROUND_DISABLED_DESCRIPTION;
+    const backgroundDescription = !this.canRunInBackground()
+      ? AGENT_BACKGROUND_DISABLED_DESCRIPTION
+      : this.autoBackgroundOnTimeout()
+        ? AGENT_BACKGROUND_DESCRIPTION
+        : AGENT_BACKGROUND_DESCRIPTION.replace(
+            /\r?\n\r?\nIf a foreground subagent automatically moves[\s\S]*?no further periodic reviews are scheduled\./,
+            '',
+          );
     let description = `${AGENT_DESCRIPTION_BASE}\n\n${backgroundDescription}`;
     if (this.flags.enabled(SUBAGENT_FORK_FLAG_ID)) {
       description += `\n\n${AGENT_FORK_DESCRIPTION}`;
@@ -457,7 +473,7 @@ export class SubagentTool implements ISubagentTool {
 
   private async execution(
     args: SubagentToolInput,
-    { toolCallId, signal, steerInterruptSignal }: ExecutableToolContext,
+    { toolCallId, signal, steerInterruptSignal, taskBatchId, taskBatchCompletion }: ExecutableToolContext,
   ): Promise<ExecutableToolResult> {
     try {
       signal.throwIfAborted();
@@ -486,11 +502,7 @@ export class SubagentTool implements ISubagentTool {
       }
       const timeoutMs = resolveSubagentTimeoutMs(this.config);
       const autoBackgroundAfterMs = resolveSubagentAutoBackgroundAfterMs(this.config);
-      const autoBackgroundOnTimeout =
-        !runInBackground &&
-        allowBackground &&
-        autoBackgroundAfterMs > 0 &&
-        (timeoutMs === 0 || autoBackgroundAfterMs < timeoutMs);
+      const autoBackgroundOnTimeout = !runInBackground && this.autoBackgroundOnTimeout();
 
       const controller = new AbortController();
       const abortBeforeRegister = (): void => {
@@ -527,6 +539,8 @@ export class SubagentTool implements ISubagentTool {
               : timeoutMs - autoBackgroundAfterMs
             : undefined,
           autoBackgroundOnTimeout,
+          notificationGroupId: autoBackgroundOnTimeout ? taskBatchId : undefined,
+          notificationGroupCompletion: autoBackgroundOnTimeout ? taskBatchCompletion : undefined,
           signal: runInBackground ? undefined : signal,
         };
         taskId = this.tasks.registerTask(
@@ -592,6 +606,7 @@ export class SubagentTool implements ISubagentTool {
               args.description,
               allowBackground,
               release === 'detached',
+              release === 'timeout_detached' ? taskBatchId : undefined,
             ),
           };
         }
@@ -752,12 +767,16 @@ function formatBackgroundAgentResult(
   description: string,
   allowBackground: boolean,
   detachedByUser: boolean,
+  notificationGroupId?: string,
 ): string {
-  const nextStep = allowBackground
-    ? `next_step: The completion arrives automatically in a later turn — do NOT wait, poll, or call TaskOutput on it; continue with other work or hand back to the user. (If you have nothing to do until it finishes, run such tasks in the foreground next time.)`
-    : 'next_step: The completion arrives automatically in a later turn.';
+  const nextStep = notificationGroupId !== undefined
+    ? `next_step: Inspect the returned task ID and status now. Continue with other work if available. If none remains and you need the batch results, call WaitFor once with batch_id "${notificationGroupId}" and an appropriate timeout. The wait makes no LLM requests and can be interrupted by new input. This batch gets one progress review 30 seconds after backgrounding. Normal completion is bundled after every task finishes unless WaitFor already returned the results; a harness-detected hard failure arrives early. Do not create delay commands or poll to reproduce these notifications; no further periodic reviews are scheduled.`
+    : allowBackground
+      ? `next_step: The completion arrives automatically in a later turn — do NOT wait, poll, or call TaskOutput on it; continue with other work or hand back to the user. (If you have nothing to do until it finishes, run such tasks in the foreground next time.)`
+      : 'next_step: The completion arrives automatically in a later turn.';
   return [
     `task_id: ${taskId}`,
+    ...(notificationGroupId === undefined ? [] : [`batch_id: ${notificationGroupId}`]),
     'status: running',
     `agent_id: ${handle.agentId}`,
     `actual_subagent_type: ${handle.profileName}`,

@@ -25,6 +25,8 @@ export interface ToolExecutorExecuteOptions {
   readonly steerSignal?: AbortSignal;
   readonly steerInterruptSignal?: AbortSignal;
   readonly turnId: number;
+  readonly taskBatchId?: string;
+  readonly taskBatchCompletion?: Promise<void>;
   readonly trace?: LLMRequestTrace;
   readonly onToolCall?: (payload: ToolCallStartedPayload) => void;
 }

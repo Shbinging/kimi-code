@@ -49,7 +49,7 @@ export const SecondaryModelConfigSchema = z.object({
 export type SecondaryModelConfig = z.infer<typeof SecondaryModelConfigSchema>;
 
 export const DEFAULT_SUBAGENT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-export const DEFAULT_SUBAGENT_AUTO_BACKGROUND_AFTER_MS = 5000;
+export const DEFAULT_SUBAGENT_AUTO_BACKGROUND_AFTER_MS = 15000;
 
 export const SUBAGENT_TIMEOUT_ENV = 'KIMI_SUBAGENT_TIMEOUT_MS';
 

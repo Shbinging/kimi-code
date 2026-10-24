@@ -1873,7 +1873,7 @@ describe('AgentTranscriptProjector', () => {
     expect(tx.listPendingInteractions()).toEqual([]);
   });
 
-  it('surfaces a mid-turn task notification as a user input frame linked to the task', () => {
+  it('hides a mid-turn background completion notification', () => {
     const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
     const tx = new AgentTranscript('main');
     const feed = (event: ProjectorBusEvent): void => void tx.apply(projector.map(event));
@@ -1882,11 +1882,11 @@ describe('AgentTranscriptProjector', () => {
       ev({
         type: 'task.notified',
         notificationType: 'task.completed',
-        title: 'Background process completed',
+        title: 'Renamed process success',
         body: 'pnpm test — 42 passed',
         severity: 'info',
         sourceKind: 'background_task',
-        sourceId: 'task_1',
+        sourceId: 'bash-1',
       });
 
     tx.apply(projector.map(notified()));
@@ -1896,10 +1896,41 @@ describe('AgentTranscriptProjector', () => {
     feed(ev({ type: 'turn.step.started', turnId: 1, step: 1 }));
     tx.apply(projector.map(notified()));
 
+    expect(turnOps('t1', tx.getItems()).steps[0]!.frames).toHaveLength(0);
+  });
+
+  it('hides informational batch notifications and keeps failure summaries', () => {
+    const projector = new AgentTranscriptProjector('main', TEST_SESSION_ID);
+    const tx = new AgentTranscript('main');
+    const feed = (event: ProjectorBusEvent): void => void tx.apply(projector.map(event));
+    const notified = (
+      notificationType: string,
+      title: string,
+      body: string,
+    ): ProjectorBusEvent =>
+      ev({
+        type: 'task.notified',
+        notificationType,
+        title,
+        body,
+        severity: notificationType === 'task.batch_failed' ? 'warning' : 'info',
+        sourceKind: 'background_task',
+        sourceId: 'turn-1:call-1,call-2',
+      });
+
+    feed(ev({ type: 'turn.started', turnId: 1, origin: { kind: 'user' } }));
+    feed(ev({ type: 'turn.step.started', turnId: 1, step: 1 }));
+    feed(notified('task.batch_review', 'Background batch progress', '2 tasks are running.'));
+    feed(notified('task.batch_completed', 'Renamed batch success', 'All tasks completed.'));
+    expect(turnOps('t1', tx.getItems()).steps[0]!.frames).toHaveLength(0);
+
+    feed(notified('task.batch_failed', 'Background batch failed', 'One task failed.'));
+    feed(notified('task.batch_failed', 'Background batch finished with failures', 'Final states.'));
     const frames = turnOps('t1', tx.getItems()).steps[0]!.frames;
-    const frame = frames.find((f) => f.kind === 'text' && f.role === 'user');
-    expect(frame).toMatchObject({ kind: 'text', role: 'user', taskId: 'task_1' });
-    expect(frame?.kind === 'text' && frame.text).toContain('Background process completed');
+    expect(frames.map((frame) => frame.kind === 'text' && frame.text)).toEqual([
+      'Background batch failed\nOne task failed.',
+      'Background batch finished with failures\nFinal states.',
+    ]);
   });
 
   it('attaches a between-steps task notification to the following step', () => {
@@ -1910,8 +1941,8 @@ describe('AgentTranscriptProjector', () => {
     const notified = (sourceId: string): ProjectorBusEvent =>
       ev({
         type: 'task.notified',
-        notificationType: 'task.completed',
-        title: 'Background agent completed',
+        notificationType: 'task.failed',
+        title: 'Background agent failed',
         body: 'inspect done.',
         severity: 'info',
         sourceKind: 'background_task',
@@ -1940,8 +1971,8 @@ describe('AgentTranscriptProjector', () => {
     feed(
       ev({
         type: 'task.notified',
-        notificationType: 'task.completed',
-        title: 'Background agent completed',
+        notificationType: 'task.failed',
+        title: 'Background agent failed',
         body: 'inspect done.',
         severity: 'info',
         sourceKind: 'background_task',
@@ -1961,8 +1992,8 @@ describe('AgentTranscriptProjector', () => {
     feed(
       ev({
         type: 'task.notified',
-        notificationType: 'task.completed',
-        title: 'Background agent completed',
+        notificationType: 'task.failed',
+        title: 'Background agent failed',
         body: 'second task done.',
         severity: 'info',
         sourceKind: 'background_task',
@@ -1985,8 +2016,8 @@ describe('AgentTranscriptProjector', () => {
     feed(
       ev({
         type: 'task.notified',
-        notificationType: 'task.completed',
-        title: 'Background agent completed',
+        notificationType: 'task.failed',
+        title: 'Background agent failed',
         body: 'inspect done.',
         severity: 'info',
         sourceKind: 'background_task',
@@ -3213,8 +3244,8 @@ describe('AgentTranscriptProjector', () => {
       const wireDir = join(home, 'sessions', 'ws', 's1', 'agents', 'main');
       await mkdir(wireDir, { recursive: true });
       const notification =
-        '<notification id="task:task_9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task_9">\nTitle: Background agent completed\nSeverity: info\ninspect done.\n</notification>';
-      const taskOrigin = { kind: 'task', taskId: 'task_9', status: 'completed', notificationId: 'n1' };
+        '<notification id="task:task_9:failed" category="task" type="task.failed" source_kind="background_task" source_id="task_9">\nTitle: Background agent failed\nSeverity: warning\ninspect failed.\n</notification>';
+      const taskOrigin = { kind: 'task', taskId: 'task_9', status: 'failed', notificationId: 'n1' };
       const opening = [
         { type: 'context.append_message', message: { role: 'user', content: [{ type: 'text', text: 'hi' }], toolCalls: [], origin: { kind: 'user' } }, time: 1000 },
         { type: 'context.append_message', message: { role: 'assistant', content: [{ type: 'text', text: 'answer' }], toolCalls: [] }, time: 2000 },

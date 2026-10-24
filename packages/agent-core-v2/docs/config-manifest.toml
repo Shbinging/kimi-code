@@ -427,7 +427,7 @@ merge_all_available_skills = true
 
 [subagent]
 timeout_ms = 7200000
-auto_background_after_ms = 5000
+auto_background_after_ms = 15000
 
 # ##########################################################################
 # swarm

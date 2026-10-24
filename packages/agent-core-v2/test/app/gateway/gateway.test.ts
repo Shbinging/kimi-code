@@ -51,7 +51,11 @@ describe('RestGateway', () => {
     ix = disposables.add(new TestInstantiationService());
     promptCalls = [];
     turnService = stubLoopWithHooks({ hasActiveTurn: true });
-    turnService.submit = (input: UserEntry) => { promptCalls.push({ ...input.message, toolCalls: [], origin: input.meta?.origin as PromptOrigin | undefined }); return { id: 'p' }; };
+    const submit = turnService.submit;
+    turnService.submit = (input: UserEntry) => {
+      promptCalls.push({ ...input.message, toolCalls: [], origin: input.meta?.origin as PromptOrigin | undefined });
+      return submit(input);
+    };
 
     const agentHandle: IAgentScopeHandle = {
       id: 'main',
@@ -139,6 +143,14 @@ describe('RestGateway', () => {
     expect(promptCalls).toHaveLength(1);
     expect(textOf(promptCalls[0]!)).toBe('hello');
     expect(promptCalls[0]!.origin).toMatchObject({ kind: 'user' });
+  });
+
+  it('returns the turn id when steering into an untracked active turn', async () => {
+    turnService.startTurn();
+    const gw = ix.get(IRestGateway);
+
+    await expect(gw.steer('s1', 'main', 'redirect')).resolves.toEqual({ turn_id: 1 });
+    expect(textOf(promptCalls[0]!)).toBe('redirect');
   });
 
   it('aborts the active turn signal on cancel', async () => {

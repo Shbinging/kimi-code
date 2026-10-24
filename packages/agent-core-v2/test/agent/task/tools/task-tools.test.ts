@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   IAgentTaskService,
   type AgentTask,
+  type AgentTaskBatchWaitResult,
   type AgentTaskInfo,
   type AgentTaskOutputSnapshot,
   type AgentTaskTrackOptions,
@@ -126,12 +127,20 @@ class FakeTaskService implements IAgentTaskService {
   readonly suppressCalls: string[] = [];
   readonly waitCalls: Array<{ taskId: string; timeoutMs: number | undefined }> = [];
   readonly waitDeliveries: Array<readonly AgentTaskWaitDelivery[]> = [];
+  readonly batchWaitDeliveries: string[] = [];
   waitDelegate:
     | ((
         taskId: string,
         timeoutMs: number | undefined,
         signal: AbortSignal | undefined,
       ) => Promise<AgentTaskInfo | undefined>)
+    | undefined;
+  waitBatchDelegate:
+    | ((
+        groupId: string,
+        timeoutMs: number | undefined,
+        signal: AbortSignal | undefined,
+      ) => Promise<AgentTaskBatchWaitResult | undefined>)
     | undefined;
 
   private readonly entries = new Map<string, FakeTaskEntry>();
@@ -161,6 +170,8 @@ class FakeTaskService implements IAgentTaskService {
   registerTask(_task: AgentTask, _options?: RegisterAgentTaskOptions): string {
     throw new Error('registerTask is not implemented in FakeTaskService.');
   }
+
+  completeNotificationGroupRegistration(_groupId: string): void {}
 
   getTask(taskId: string): AgentTaskInfo | undefined {
     return this.entries.get(taskId)?.info;
@@ -215,6 +226,10 @@ class FakeTaskService implements IAgentTaskService {
     this.waitDeliveries.push(tasks);
   }
 
+  markNotificationGroupDeliveredViaWait(groupId: string): void {
+    this.batchWaitDeliveries.push(groupId);
+  }
+
   detach(taskId: string): AgentTaskInfo | undefined {
     const entry = this.entries.get(taskId);
     if (entry === undefined) return undefined;
@@ -265,6 +280,16 @@ class FakeTaskService implements IAgentTaskService {
       return this.waitDelegate(taskId, timeoutMs, signal);
     }
     return this.entries.get(taskId)?.info;
+  }
+
+  async waitForNotificationGroup(
+    groupId: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<AgentTaskBatchWaitResult | undefined> {
+    const result = await this.waitBatchDelegate?.(groupId, timeoutMs, signal);
+    if (result?.complete === true) this.markNotificationGroupDeliveredViaWait(groupId);
+    return result;
   }
 
   async waitForForegroundRelease(
@@ -786,6 +811,8 @@ describe('WaitForTool', () => {
     expect(tool.name).toBe('WaitFor');
     expect(WaitForInputSchema.safeParse({ timeout: 60 }).success).toBe(true);
     expect(WaitForInputSchema.safeParse({ timeout: 60, task_id: 'bash-1' }).success).toBe(true);
+    expect(WaitForInputSchema.safeParse({ timeout: 60, batch_id: 'turn-0:call-1' }).success).toBe(true);
+    expect(WaitForInputSchema.safeParse({ timeout: 60, task_id: 'bash-1', batch_id: 'turn-0:call-1' }).success).toBe(false);
     expect(WaitForInputSchema.safeParse({ timeout: 90 }).success).toBe(true);
     expect(WaitForInputSchema.safeParse({}).success).toBe(false);
     expect(WaitForInputSchema.safeParse({ timeout: 0 }).success).toBe(false);
@@ -799,6 +826,7 @@ describe('WaitForTool', () => {
       properties: {
         timeout: { type: 'integer' },
         task_id: { type: 'string' },
+        batch_id: { type: 'string' },
       },
     });
   });
@@ -968,6 +996,118 @@ describe('WaitForTool', () => {
       timeout_ms: 10_000,
       has_task_id: true,
     });
+  });
+
+  it('waits for a whole batch and returns every result without duplicate delivery', async () => {
+    const tasks = new FakeTaskService();
+    const groupId = 'turn-0:call-1,call-2';
+    tasks.add(
+      processTask({ taskId: 'bash-batch01', status: 'completed', exitCode: 0 }),
+      outputSnapshot('BATCH-A\n'),
+    );
+    tasks.add(
+      processTask({ taskId: 'bash-batch02', status: 'failed', stopReason: 'command failed' }),
+      outputSnapshot('BATCH-B\n'),
+    );
+    const waitBatch = vi.fn(async () => ({
+      tasks: [tasks.getTask('bash-batch01')!, tasks.getTask('bash-batch02')!],
+      complete: true,
+    }));
+    tasks.waitBatchDelegate = waitBatch;
+
+    const { records, telemetry } = waitTelemetry();
+    const result = await executeTool(
+      new WaitForTool(tasks, telemetry, stubFlag(true), stubGoal(), agentScope()),
+      context('wait_batch', { timeout: 10, batch_id: groupId }),
+    );
+    const output = outputString(result);
+
+    expect(result.isError ?? false).toBe(false);
+    expect(waitBatch).toHaveBeenCalledWith(groupId, 10_000, expect.anything());
+    expect(output).toContain('wait_status: completed');
+    expect(output).toContain(`batch_id: ${groupId}`);
+    expect(output).toContain('[finished_batch]');
+    expect(output).toContain('[output]\nBATCH-A');
+    expect(output).toContain('[output]\nBATCH-B');
+    expect(output).toContain('status: failed');
+    expect(tasks.batchWaitDeliveries).toEqual([groupId]);
+    expect(tasks.waitDeliveries).toEqual([]);
+    expect(lastEvent(records)?.properties).toMatchObject({
+      outcome: 'completed',
+      has_task_id: true,
+      extra_completed_count: 1,
+    });
+  });
+
+  it('returns running batch tasks on timeout without marking the batch delivered', async () => {
+    const tasks = new FakeTaskService();
+    const groupId = 'turn-0:call-slow';
+    tasks.add(processTask({ taskId: 'bash-slow001' }));
+    tasks.waitBatchDelegate = async () => ({
+      tasks: [tasks.getTask('bash-slow001')!],
+      complete: false,
+    });
+
+    const result = await executeTool(
+      new WaitForTool(tasks, recordingTelemetry([]), stubFlag(true), stubGoal(), agentScope()),
+      context('wait_batch_timeout', { timeout: 10, batch_id: groupId }),
+    );
+    const output = outputString(result);
+
+    expect(output).toContain('wait_status: timed_out');
+    expect(output).toContain(`batch_id: ${groupId}`);
+    expect(output).toContain('[still_running]');
+    expect(output).toContain('bash-slow001');
+    expect(tasks.batchWaitDeliveries).toEqual([]);
+    expect(tasks.waitDeliveries).toEqual([]);
+  });
+
+  it('steers out of a batch wait without stopping its tasks', async () => {
+    const tasks = new FakeTaskService();
+    const groupId = 'turn-0:call-steer';
+    tasks.add(processTask({ taskId: 'bash-steer01' }));
+    const waitBatch = vi.fn(
+      (_groupId: string, _timeoutMs: number | undefined, waitSignal: AbortSignal | undefined) =>
+        new Promise<never>((_resolve, reject) => {
+          waitSignal?.addEventListener('abort', () => reject(abortError()), { once: true });
+        }),
+    );
+    tasks.waitBatchDelegate = waitBatch;
+    const { records, telemetry } = waitTelemetry();
+    const steer = new AbortController();
+
+    const pending = executeTool(
+      new WaitForTool(tasks, telemetry, stubFlag(true), stubGoal(), agentScope()),
+      {
+        ...context('wait_batch_steer', { timeout: 90, batch_id: groupId }),
+        steerSignal: steer.signal,
+      },
+    );
+    await vi.waitFor(() => {
+      expect(waitBatch).toHaveBeenCalledTimes(1);
+    });
+    steer.abort(abortError());
+    const result = await pending;
+    const output = outputString(result);
+
+    expect(result.isError ?? false).toBe(false);
+    expect(output).toContain('wait_status: interrupted');
+    expect(output).toContain('reason: steer');
+    expect(output).toContain(`batch_id: ${groupId}`);
+    expect(tasks.getTask('bash-steer01')?.status).toBe('running');
+    expect(tasks.batchWaitDeliveries).toEqual([]);
+    expect(lastEvent(records)?.properties).toMatchObject({ outcome: 'interrupted' });
+  });
+
+  it('reports an unknown batch ID as an error', async () => {
+    const groupId = 'turn-0:unknown';
+    const result = await executeTool(
+      new WaitForTool(new FakeTaskService(), recordingTelemetry([]), stubFlag(true), stubGoal(), agentScope()),
+      context('wait_batch_unknown', { timeout: 10, batch_id: groupId }),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(outputString(result)).toContain(`Batch not found: ${groupId}`);
   });
 
   it('propagates an abort of the execution signal and tracks the aborted outcome', async () => {

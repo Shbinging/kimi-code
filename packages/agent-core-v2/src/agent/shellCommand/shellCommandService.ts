@@ -117,6 +117,7 @@ export class AgentShellCommandService implements IAgentShellCommandService {
       const result = await execution.execute({
         turnId: -1,
         toolCallId: 'shell-command',
+        autoBackgroundOnTimeout: false,
         signal: controller.signal,
         onUpdate: (update: ToolUpdate) => {
           if (update.kind === 'stdout') stdout += update.text ?? '';

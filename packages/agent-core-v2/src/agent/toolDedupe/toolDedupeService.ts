@@ -233,6 +233,7 @@ export class AgentToolDedupeService extends Service implements IAgentToolDedupeS
         event.toolCall.name,
         event.args,
         event.trace,
+        event.tool?.allowSameStepDedupe !== false,
       );
       if (checked.syntheticResult !== null) {
         event.veto(checked.syntheticResult);
@@ -441,21 +442,24 @@ export class AgentToolDedupeService extends Service implements IAgentToolDedupeS
     toolName: string,
     args: unknown,
     trace: LLMRequestTrace | undefined,
+    allowSameStepDedupe = true,
   ): CheckedToolCall {
     const key = makeKey(toolName, args);
     const index = this.stepCalls.length;
     this.stepCalls.push(key);
     this.callKeyByCallId.set(toolCallId, key);
 
-    const existing = this.stepDeferreds.get(key);
+    const existing = allowSameStepDedupe ? this.stepDeferreds.get(key) : undefined;
     if (existing !== undefined) {
       this.syntheticCallIds.add(toolCallId);
       this.recordDupType(toolCallId, toolName, args, 'same_step', trace);
       return { syntheticResult: DEDUPE_PLACEHOLDER_RESULT };
     }
     this.recordTurnRepeat(toolCallId, toolName, args, key, trace);
-    this.stepDeferreds.set(key, makeDeferred<ToolDedupeResult>());
-    this.originalCallIndex.set(toolCallId, index);
+    if (!this.stepDeferreds.has(key)) {
+      this.stepDeferreds.set(key, makeDeferred<ToolDedupeResult>());
+      this.originalCallIndex.set(toolCallId, index);
+    }
     if (this.consecutiveKey === key && this.consecutiveCount > 0) {
       this.recordDupType(toolCallId, toolName, args, 'cross_step', trace);
       return { syntheticResult: null };

@@ -162,6 +162,7 @@ interface MessageDriver {
   createNewSession(): Promise<void>;
   syncRuntimeState(session?: unknown): Promise<void>;
   getCurrentSessionId(): string;
+  detachCurrentForegroundTask(): Promise<void>;
 }
 
 interface FeedbackDriver extends MessageDriver {
@@ -565,6 +566,36 @@ describe('KimiTUI message flow', () => {
     expect(harness.track).toHaveBeenCalledWith('shortcut_editor', undefined);
     expect(harness.track).toHaveBeenCalledWith('shortcut_expand', undefined);
     expect(harness.track).toHaveBeenCalledWith('shortcut_paste', { kind: 'text' });
+  });
+
+  it('updates every subagent card immediately after a batch detach', async () => {
+    const tasks = ['agent-1', 'agent-2'].map((agentId) => ({
+      taskId: `task-${agentId}`,
+      kind: 'agent',
+      agentId,
+      description: agentId,
+      status: 'running',
+      detached: false,
+      startedAt: 0,
+      endedAt: null,
+    }));
+    const detachBackgroundTask = vi.fn(async (taskId: string) => ({
+      ...tasks.find((task) => task.taskId === taskId)!,
+      detached: true,
+    }));
+    const session = makeSession({
+      listBackgroundTasks: vi.fn(async () => tasks),
+      detachBackgroundTask,
+    });
+    const { driver } = await makeDriver(session);
+    const markBackgrounded = vi
+      .spyOn(driver.streamingUI, 'markSubagentBackgrounded')
+      .mockReturnValue(true);
+
+    await driver.detachCurrentForegroundTask();
+
+    expect(detachBackgroundTask).toHaveBeenCalledTimes(2);
+    expect(markBackgrounded.mock.calls).toEqual([['agent-1'], ['agent-2']]);
   });
 
   it('lazily creates the session on the first message (v2 engine)', async () => {
@@ -4611,7 +4642,7 @@ command = "vim"
     expect(harness.deleteFile).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps a skill steer media lease unclaimed by an untracked turn it cannot merge into', async () => {
+  it('binds a skill steer media lease to the untracked turn it merges into', async () => {
     process.env['KIMI_CODE_HOME'] = await makeTempHome();
     const session = makeSession({
       listSkills: vi.fn(async () => [
@@ -4635,10 +4666,6 @@ command = "vim"
       { type: 'turn.ended', agentId: 'main', turnId: 1, reason: 'completed' } as Event,
       (item) => { driver.sendQueuedMessage(session, item); },
     );
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(harness.deleteFile).not.toHaveBeenCalled();
-
-    emitTurn(driver, 2);
     await vi.waitFor(() => {
       expect(harness.deleteFile).toHaveBeenCalledExactlyOnceWith('file-goal-skill');
     });

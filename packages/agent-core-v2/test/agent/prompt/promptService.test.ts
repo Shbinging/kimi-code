@@ -1,11 +1,14 @@
 import { Readable } from 'node:stream';
 
+import { createControlledPromise } from '@antfu/utils';
+
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { IEventBus } from '#/app/event/eventBus';
 import { IFileService } from '#/app/file/fileService';
 import { IAgentContextMemoryService } from '#/agent/contextMemory/contextMemory';
 import type { ContextMessage, PromptOrigin } from '#/agent/contextMemory/types';
+import { IAgentPromptChannel } from '#/agent/loop/promptChannel';
 import { IAgentLoopService, type PromptHandle } from '#/agent/loop/loop';
 import { TurnStarted } from '#/agent/loop/turnEvents';
 import { TurnSteer } from '#/agent/loop/turnOps';
@@ -284,6 +287,54 @@ describe('prompt queue', () => {
     });
   });
 
+  it('drops a stale completion that arrives after the steered request starts', async () => {
+    const firstStarted = createControlledPromise<void>();
+    const secondStarted = createControlledPromise<void>();
+    const releaseFirst = createControlledPromise<void>();
+    const releaseSecond = createControlledPromise<void>();
+    const firstFinished = createControlledPromise<void>();
+    const histories: string[] = [];
+    let calls = 0;
+    setup({
+      generate: {
+        generate: async (_config, content, { onEvent }) => {
+          calls += 1;
+          histories.push(JSON.stringify(content.messages));
+          if (calls === 1) {
+            firstStarted.resolve();
+            await releaseFirst;
+            onEvent?.({ type: 'llm.streaming.part', part: { type: 'text', text: 'stale' } });
+            onEvent?.({ type: 'llm.done' });
+            firstFinished.resolve();
+            return;
+          }
+          secondStarted.resolve();
+          await releaseSecond;
+          onEvent?.({ type: 'llm.streaming.part', part: { type: 'text', text: 'after steer' } });
+          onEvent?.({ type: 'llm.done' });
+        },
+      },
+    });
+
+    const active = await enqueue(loop, { message: message('active') });
+    await firstStarted;
+    const turn = await active.launched;
+    const queued = await enqueue(loop, { message: message('redirect') });
+    await loop.steer([queued.id]);
+    await secondStarted;
+    releaseFirst.resolve();
+    await firstFinished;
+    releaseSecond.resolve();
+    await loop.settled();
+
+    expect(calls).toBe(2);
+    expect(histories[1]).toContain('active\\n\\nredirect');
+    expect(ctx.context.get().at(-1)?.content).toEqual([{ type: 'text', text: 'after steer' }]);
+    expect(JSON.stringify(ctx.context.get())).not.toContain('stale');
+    expect(turn?.id).toBe(0);
+    await expect(turn?.result).resolves.toMatchObject({ type: 'completed' });
+  });
+
   it('reserves a messageId on prompt.steered and publishes turn.steer at materialize', async () => {
     setup();
     const hold = holdNextStep();
@@ -489,6 +540,65 @@ describe('prompt queue', () => {
     expect(loop.snapshot().activePromptId).toBeUndefined();
     await turn?.result;
     await loop.settled();
+  });
+
+  it('merges injections into task-origin turns without interrupting the current step', async () => {
+    setup();
+    ctx.mockNextResponse({ type: 'text', text: 'task response' });
+    ctx.mockNextResponse({ type: 'text', text: 'after injection' });
+    let stepSignal: AbortSignal | undefined;
+    let releaseGate!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    let armed = true;
+    loop.hooks.onWillBeginStep.register('test-injection-steer', async (hookCtx, next) => {
+      if (armed) {
+        armed = false;
+        stepSignal = hookCtx.signal;
+        markStarted();
+        await gate;
+      }
+      await next();
+    });
+    const steered: PromptSteered[] = [];
+    ctx.get(IEventBus).subscribe(PromptSteered, (event) => steered.push(event));
+    loop.notify({
+      message: {
+        role: 'user',
+        id: 'task-turn',
+        content: [{ type: 'text', text: 'background update' }],
+        toolCalls: [],
+        origin: {
+          kind: 'task',
+          taskId: 'bash-1',
+          status: 'running',
+          notificationId: 'task:bash-1:running',
+        },
+      },
+      turnScoped: false,
+    });
+    await started;
+
+    loop.submit(
+      {
+        message: { role: 'user', content: message('injected update').content },
+        meta: { origin: { kind: 'injection', variant: 'test' } as PromptOrigin },
+      },
+      { steerIfActive: true },
+    );
+    expect(steered).toHaveLength(1);
+    const aborted = stepSignal?.aborted;
+    releaseGate();
+    await loop.settled();
+
+    expect(aborted).toBe(false);
+    expect(ctx.llmCalls).toHaveLength(2);
+    expect(JSON.stringify(ctx.context.get())).toContain('injected update');
   });
 
   it('settles blocked prompts', async () => {
@@ -943,6 +1053,67 @@ describe('prompt queue', () => {
 
     hold.release();
     await expect(handle.completion).resolves.toMatchObject({ state: 'completed' });
+    await loop.settled();
+  });
+
+  it.each(['submit', 'explicit', 'channel', 'rpc'] as const)('steers a fresh user submission into a task-origin turn with $method', async (method) => {
+    setup();
+    const hold = holdNextStep();
+    ctx.mockNextResponse({ type: 'text', text: 'task response' });
+    ctx.mockNextResponse({ type: 'text', text: 'redirected response' });
+    const steered: PromptSteered[] = [];
+    ctx.get(IEventBus).subscribe(PromptSteered, (event) => steered.push(event));
+    loop.notify({
+      message: {
+        role: 'user',
+        id: 'task-turn',
+        content: [{ type: 'text', text: 'background update' }],
+        toolCalls: [],
+        origin: {
+          kind: 'task',
+          taskId: 'bash-1',
+          status: 'running',
+          notificationId: 'task:bash-1:running',
+        },
+      },
+      turnScoped: false,
+    });
+    await hold.started;
+
+    let id: string;
+    let apiResult: Promise<unknown> | undefined;
+    if (method === 'channel' || method === 'rpc') {
+      const input = [{ type: 'text' as const, text: 'redirect the task turn' }];
+      apiResult = method === 'channel'
+        ? ctx.get(IAgentPromptChannel).submitSteer({ input })
+        : ctx.rpc.steer({ input });
+      await vi.waitFor(() => {
+        expect(steered).toHaveLength(1);
+      });
+      id = steered[0]!.promptIds[0]!;
+    } else {
+      const submitted = loop.submit(
+        {
+          message: { role: 'user', content: message('redirect the task turn').content },
+          meta: { tracked: true },
+        },
+        { steerIfActive: method === 'submit' },
+      );
+      id = submitted.id;
+      if (method === 'explicit') await loop.steer([id]);
+    }
+    const handle = apiResult === undefined ? loop.promptHandle(id)! : undefined;
+
+    expect(steered.map((event) => [event.activePromptId, event.promptIds])).toEqual([
+      ['task-turn', [id]],
+    ]);
+    if (handle !== undefined) await expect(handle.launched).resolves.toBeDefined();
+    hold.release();
+    if (apiResult !== undefined) {
+      await expect(apiResult).resolves.toEqual({ turn_id: 0 });
+    } else {
+      await expect(handle!.completion).resolves.toMatchObject({ state: 'completed' });
+    }
     await loop.settled();
   });
 

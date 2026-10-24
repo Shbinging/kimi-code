@@ -166,6 +166,43 @@ describe('AgentToolExecutorService', () => {
     });
   });
 
+  it('shares a batch id and resolves its completion only after every call returns', async () => {
+    const gate = deferred<void>();
+    const tool = new TestTool('batch', {
+      accesses: ToolAccesses.none(),
+      execute: async (_ctx, args) => {
+        if (args['wait'] === true) await gate.promise;
+        return { output: 'done' };
+      },
+    });
+    registry.register(tool);
+
+    const execution = execute([
+      toolCall('call_slow', 'batch', { wait: true }),
+      toolCall('call_fast', 'batch', { wait: false }),
+    ]);
+    await vi.waitFor(() => {
+      expect(tool.calls).toHaveLength(2);
+    });
+    const batchId = 'turn-0:call_slow,call_fast';
+    let completionCount = 0;
+    for (const call of tool.calls) {
+      expect(call.taskBatchId).toBe(batchId);
+      expect(call.taskBatchCompletion).toBeInstanceOf(Promise);
+      void call.taskBatchCompletion!.then(() => {
+        completionCount += 1;
+      });
+    }
+    await Promise.resolve();
+    expect(completionCount).toBe(0);
+
+    gate.resolve();
+    await execution;
+    await vi.waitFor(() => {
+      expect(completionCount).toBe(2);
+    });
+  });
+
   it('rejects by policy before dynamic availability when a tool-call guard denies it', async () => {
     const tool = new TestTool('blocked');
     registry.register(tool, { source: 'mcp' });

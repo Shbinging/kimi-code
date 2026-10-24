@@ -34,6 +34,8 @@ export interface RegisterAgentTaskOptions {
   readonly timeoutMs?: number;
   readonly detachTimeoutMs?: number;
   readonly autoBackgroundOnTimeout?: boolean;
+  readonly notificationGroupId?: string;
+  readonly notificationGroupCompletion?: Promise<void>;
   readonly signal?: AbortSignal;
 }
 
@@ -71,11 +73,17 @@ export interface AgentTaskWaitDelivery {
   readonly status: AgentTaskStatus;
 }
 
+export interface AgentTaskBatchWaitResult {
+  readonly tasks: readonly AgentTaskInfo[];
+  readonly complete: boolean;
+}
+
 export interface IAgentTaskService {
   readonly _serviceBrand: undefined;
 
   track(handle: ITaskHandle, options: AgentTaskTrackOptions): IAgentTaskEntry;
   registerTask(task: AgentTask, options?: RegisterAgentTaskOptions): string;
+  completeNotificationGroupRegistration(groupId: string): void;
   getTask(taskId: string): AgentTaskInfo | undefined;
   list(activeOnly?: boolean, limit?: number): readonly AgentTaskInfo[];
   persistOutput(taskId: string): void;
@@ -87,6 +95,7 @@ export interface IAgentTaskService {
   suppressTerminalNotification(taskId: string): Promise<void>;
   suppressAllTerminalNotifications(): Promise<void>;
   markTasksDeliveredViaWait(tasks: readonly AgentTaskWaitDelivery[]): void;
+  markNotificationGroupDeliveredViaWait(groupId: string): void;
   detach(taskId: string): AgentTaskInfo | undefined;
   stop(taskId: string, reason?: string): Promise<AgentTaskInfo | undefined>;
   stopByUser(taskId: string): Promise<AgentTaskInfo | undefined>;
@@ -97,6 +106,11 @@ export interface IAgentTaskService {
     timeoutMs?: number,
     signal?: AbortSignal,
   ): Promise<AgentTaskInfo | undefined>;
+  waitForNotificationGroup(
+    groupId: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<AgentTaskBatchWaitResult | undefined>;
   waitForForegroundRelease(
     taskId: string,
   ): Promise<ForegroundTaskReleaseReason | undefined>;

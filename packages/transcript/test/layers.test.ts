@@ -5,7 +5,7 @@ import { detachGrades, gradeFor, needsResetOnTransition } from '#/granularity/gr
 import { paginateTurns } from '#/pagination/paginate';
 import { ViewRegistry } from '#/view/registry';
 import { projectTranscriptUserOrigin } from '#/contract/origin';
-import { groupMessagesIntoSnapshot, type HistoryContentPart } from '#/history/groupTurns';
+import { groupMessagesIntoSnapshot, type HistoryContentPart, type HistoryMessage } from '#/history/groupTurns';
 import { foldWireRecordFacts, type HistoryWireRecord } from '#/history/foldFacts';
 import {
   transcriptOperationSchema,
@@ -587,7 +587,7 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
         role: 'user',
         content: [{
           type: 'text',
-          text: '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">\nTitle: Background agent completed\nSeverity: info\ninspect done.\n</notification>',
+          text: '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="agent-9">\nTitle: Renamed agent success\nSeverity: info\ninspect done.\n</notification>',
         }],
         toolCalls: [],
         origin: { kind: 'task', taskId: 'task-9' } as { kind: string },
@@ -614,8 +614,10 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     const userFrames = turn.steps
       .flatMap((step) => step.frames)
       .filter((f) => f.kind === 'text' && f.role === 'user');
-    expect(userFrames.map((f) => f.kind === 'text' && f.taskId)).toEqual(['task-9', 'task-8']);
-    expect(userFrames[0]).toMatchObject({ text: 'Background agent completed\ninspect done.' });
+    expect(userFrames.map((f) => f.kind === 'text' && f.taskId)).toEqual(['task-8']);
+    expect(userFrames[0]).toMatchObject({
+      text: '<notification id="task:task-8:completed"></notification>',
+    });
     const assistantTexts = turn.steps
       .flatMap((step) => step.frames)
       .filter((f) => f.kind === 'text' && f.role === 'assistant')
@@ -624,8 +626,52 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     expect(turn.steps).toHaveLength(2);
     expect(turn.steps[1]?.frames.map((f) => f.kind === 'text' && f.role)).toEqual([
       'user',
-      'user',
       'assistant',
+    ]);
+  });
+
+  it('hides informational batch notifications and folds failure summaries without task XML', () => {
+    const notification = (
+      type: string,
+      title: string,
+      body: string,
+      children = '',
+    ): HistoryMessage => ({
+      role: 'user',
+      content: [{
+        type: 'text',
+        text: `<notification id="batch-${type}" category="task" type="${type}" source_kind="background_task" source_id="batch-1">\nTitle: ${title}\nSeverity: ${type === 'task.batch_failed' ? 'warning' : 'info'}\n${body}\n${children}</notification>`,
+      }],
+      toolCalls: [],
+      origin: { kind: 'task', taskId: 'batch-1' } as { kind: string },
+    });
+    const snapshot = groupMessagesIntoSnapshot(
+      [
+        { role: 'user', content: [{ type: 'text', text: 'run the batch' }], toolCalls: [], origin: { kind: 'user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'started' }], toolCalls: [] },
+        notification('task.batch_review', 'Background batch progress', '2 tasks are running.'),
+        notification('task.batch_completed', 'Renamed batch success', 'All tasks completed.'),
+        notification(
+          'task.batch_failed',
+          'Background batch failed',
+          'One task failed.',
+          '<task task_id="bash-1" kind="process" status="failed">\nfailure details\n<output-preview>error output</output-preview>\n</task>\n',
+        ),
+        notification('task.batch_failed', 'Background batch finished with failures', 'Final states.'),
+        { role: 'assistant', content: [{ type: 'text', text: 'continuing' }], toolCalls: [] },
+      ],
+      { taskOriginTurnTaskIds: new Set() },
+    );
+
+    const turn = snapshot.items.find((item) => item.kind === 'turn');
+    if (turn?.kind !== 'turn') throw new Error('expected turn');
+    const userFrames = turn.steps
+      .flatMap((step) => step.frames)
+      .filter((frame) => frame.kind === 'text' && frame.role === 'user');
+    expect(turn.prompt).toBe('run the batch');
+    expect(userFrames.map((frame) => frame.kind === 'text' && frame.text)).toEqual([
+      'Background batch failed\nOne task failed.',
+      'Background batch finished with failures\nFinal states.',
     ]);
   });
 
@@ -729,8 +775,8 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
 
   it('stops folded notification text before child output blocks', () => {
     const xml = [
-      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
-      'Title: Background agent completed',
+      '<notification id="task:task-9:failed" category="task" type="task.failed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent failed',
       'Severity: info',
       'inspect done.',
       '<output-file>/tmp/out.log</output-file>',
@@ -750,7 +796,7 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     const turn = snapshot.items[0];
     if (turn?.kind !== 'turn') throw new Error('expected turn');
     const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
-    expect(frame).toMatchObject({ text: 'Background agent completed\ninspect done.' });
+    expect(frame).toMatchObject({ text: 'Background agent failed\ninspect done.' });
   });
 
   it('stops folded notification text before an inline answer block', () => {
@@ -781,8 +827,8 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
 
   it('buffers a folded notification into the next step, or drops it when no turn is open yet', () => {
     const xml = [
-      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
-      'Title: Background agent completed',
+      '<notification id="task:task-9:failed" category="task" type="task.failed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent failed',
       'Severity: info',
       'early done.',
       '</notification>',
@@ -803,7 +849,7 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
       'assistant',
     ]);
     expect(turn.steps[0]?.frames[0]).toMatchObject({
-      text: 'Background agent completed\nearly done.',
+      text: 'Background agent failed\nearly done.',
       taskId: 'task-9',
     });
 
@@ -823,8 +869,8 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
 
   it('keeps body lines that start with an angle bracket but are not output blocks', () => {
     const xml = [
-      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
-      'Title: Background agent completed',
+      '<notification id="task:task-9:failed" category="task" type="task.failed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent failed',
       'Severity: info',
       'first line.',
       '<div>pasted markup</div>',
@@ -844,14 +890,14 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     if (turn?.kind !== 'turn') throw new Error('expected turn');
     const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
     expect(frame).toMatchObject({
-      text: 'Background agent completed\nfirst line.\n<div>pasted markup</div>\nlast line.',
+      text: 'Background agent failed\nfirst line.\n<div>pasted markup</div>\nlast line.',
     });
   });
 
   it('parses only the leading header lines, keeping later Title-like lines as body', () => {
     const xml = [
-      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
-      'Title: Background agent completed',
+      '<notification id="task:task-9:failed" category="task" type="task.failed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent failed',
       'Severity: info',
       'first line.',
       'Title: details',
@@ -871,14 +917,14 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     if (turn?.kind !== 'turn') throw new Error('expected turn');
     const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
     expect(frame).toMatchObject({
-      text: 'Background agent completed\nfirst line.\nTitle: details\nlast line.',
+      text: 'Background agent failed\nfirst line.\nTitle: details\nlast line.',
     });
   });
 
   it('keeps a body whose first line starts with Severity:', () => {
     const xml = [
-      '<notification id="task:task-9:completed" category="task" type="task.completed" source_kind="background_task" source_id="task-9">',
-      'Title: Background agent completed',
+      '<notification id="task:task-9:failed" category="task" type="task.failed" source_kind="background_task" source_id="task-9">',
+      'Title: Background agent failed',
       'Severity: info',
       'Severity: this line is the task description, not a header',
       'last line.',
@@ -897,7 +943,7 @@ describe('groupMessagesIntoSnapshot (cold path)', () => {
     if (turn?.kind !== 'turn') throw new Error('expected turn');
     const frame = turn.steps.flatMap((step) => step.frames).find((f) => f.kind === 'text' && f.role === 'user');
     expect(frame).toMatchObject({
-      text: 'Background agent completed\nSeverity: this line is the task description, not a header\nlast line.',
+      text: 'Background agent failed\nSeverity: this line is the task description, not a header\nlast line.',
     });
   });
 

@@ -59,6 +59,9 @@ export function createRequestActor(
   messageResolvers: readonly MessageResolver[] = [],
 ) {
   return fromCallback<LlmEvent, LlmInput>(({ input, sendBack }) => {
+    const forward: typeof sendBack = (event) => {
+      if (!input.signal.aborted) sendBack(event);
+    };
     void (async () => {
       try {
         const credential = input.config.credentialProvider?.resolve();
@@ -83,12 +86,12 @@ export function createRequestActor(
           { ...input.content, messages },
           {
             signal: input.signal,
-            onEvent: sendBack,
+            onEvent: forward,
           },
         );
       } catch (error) {
         if (isAbortError(error) || input.signal.aborted) return;
-        sendBack({ type: 'llm.failed.remote', error: toLlmErrorMessage(error), rawError: error });
+        forward({ type: 'llm.failed.remote', error: toLlmErrorMessage(error), rawError: error });
       }
     })();
   });

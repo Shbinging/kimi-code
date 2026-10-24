@@ -122,9 +122,11 @@ describe('AgentShellCommandService', () => {
         description: 'run',
         approvalRule: 'Bash',
         execute: async (ctx: {
+          autoBackgroundOnTimeout?: boolean;
           onForegroundTaskStart?: (taskId: string) => void;
           onUpdate?: (update: { kind: string; text: string }) => void;
         }) => {
+          expect(ctx.autoBackgroundOnTimeout).toBe(false);
           ctx.onForegroundTaskStart?.('task-9');
           ctx.onUpdate?.({ kind: 'stdout', text: 'hi' });
           return { isError: false, output: 'hi' };

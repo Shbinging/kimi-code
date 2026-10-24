@@ -68,6 +68,9 @@ export const MCP_OAUTH_AUTHORIZATION_URL_TOOL_UPDATE = 'mcp.oauth.authorization_
 export interface ExecutableToolContext {
   readonly turnId: number;
   readonly toolCallId: string;
+  readonly taskBatchId?: string;
+  readonly taskBatchCompletion?: Promise<void>;
+  readonly autoBackgroundOnTimeout?: boolean;
   readonly trace?: LLMRequestTrace;
   readonly metadata?: unknown;
   readonly signal: AbortSignal;
@@ -91,6 +94,7 @@ export interface RunnableToolExecution {
 export type ToolExecution = RunnableToolExecution | ExecutableToolErrorResult;
 
 export interface ExecutableTool<Input = unknown> extends Tool {
+  readonly allowSameStepDedupe?: boolean;
   resolveExecution(input: Input): ToolExecution | Promise<ToolExecution>;
 }
 

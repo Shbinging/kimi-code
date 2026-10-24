@@ -384,17 +384,29 @@ export function groupMessagesIntoSnapshot(
       if (isTaskOrigin) {
         const origin = message.origin as { taskId?: unknown } | undefined;
         const taskId = typeof origin?.taskId === 'string' ? origin.taskId : undefined;
+        const text = textOf(message);
+        const foldedText = notificationFrameText(text);
+        const hiddenCompletion =
+          text.startsWith('<notification') &&
+          ((text.includes('type="task.completed"') &&
+            text.includes('source_kind="background_task"') &&
+            /source_id="(?:agent|bash)-/.test(text)) ||
+            (text.includes('type="task.batch_completed"') && text.includes('Severity: info')));
+        const hiddenBatchReview =
+          text.startsWith('<notification') && text.includes('type="task.batch_review"');
         const opensOwn = options?.taskOriginTurnTaskIds === undefined
           ? prevRoleAtEntry !== 'assistant' && prevRoleAtEntry !== 'tool'
           : taskId === undefined ||
             options.taskOriginTurnTaskIds.has(taskId) ||
             originKind === 'background_task';
         if (opensOwn) {
-          const opening = foldTurnOpeningInput(message);
-          startTurn(mapOrigin(message), opening.text, opening.attachmentIds);
+          const opening = hiddenCompletion || hiddenBatchReview ? undefined : foldTurnOpeningInput(message);
+          startTurn(mapOrigin(message), opening?.text, opening?.attachmentIds);
           continue;
         }
-        pendingNotificationFrames.push({ text: notificationFrameText(textOf(message)), taskId });
+        if (!hiddenCompletion && !hiddenBatchReview) {
+          pendingNotificationFrames.push({ text: foldedText, taskId });
+        }
         continue;
       }
       const bundled = bundledSkillActivations(message);
@@ -506,7 +518,8 @@ function notificationFrameText(text: string): string {
     return (
       trimmed.startsWith('<output-file') ||
       trimmed.startsWith('<output-preview') ||
-      trimmed.startsWith('<answer')
+      trimmed.startsWith('<answer') ||
+      trimmed.startsWith('<task ')
     );
   });
   const body = (childStart === -1 ? bodyLines : bodyLines.slice(0, childStart)).join('\n').trim();

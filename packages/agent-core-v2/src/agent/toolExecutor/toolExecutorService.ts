@@ -180,6 +180,15 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
     options: ToolExecutorExecuteOptions,
   ): AsyncIterable<ToolExecutionResult> {
     if (calls.length === 0) return;
+    let completeTaskBatch!: () => void;
+    const taskBatchCompletion = new Promise<void>((resolve) => {
+      completeTaskBatch = resolve;
+    });
+    options = {
+      ...options,
+      taskBatchId: `turn-${options.turnId}:${calls.map((call) => call.id).join(',')}`,
+      taskBatchCompletion,
+    };
     if (options.turnId !== this.dupTypeTurnId) {
       this.dupTypeTurnId = options.turnId;
       this.toolCallDupTypes.clear();
@@ -236,7 +245,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
           candidates.push(
             nextTimed.then(
               (result): ToolExecutionStreamEvent => ({ type: 'timed', result }),
-              (reason): ToolExecutionStreamEvent => ({ type: 'timedRejected', reason }),
+              (error): ToolExecutionStreamEvent => ({ type: 'timedRejected', reason: error }),
             ),
           );
         }
@@ -266,7 +275,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
             options,
           ).then(
             (value): SettledToolExecutionResult => ({ status: 'fulfilled', value }),
-            (reason): SettledToolExecutionResult => ({ status: 'rejected', reason }),
+            (error): SettledToolExecutionResult => ({ status: 'rejected', reason: error }),
           );
           finalizations.add(finalization);
           nextTimed = timedResults.next();
@@ -280,6 +289,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
     } finally {
       await timedResults.return?.();
       await Promise.allSettled(finalizations);
+      completeTaskBatch();
     }
   }
 
@@ -484,7 +494,7 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
         index,
         pendingResult.then(
           (value): SettledTimedToolResult => ({ status: 'fulfilled', value }),
-          (reason): SettledTimedToolResult => ({ status: 'rejected', index, reason }),
+          (error): SettledTimedToolResult => ({ status: 'rejected', index, reason: error }),
         ),
       );
     }
@@ -525,10 +535,13 @@ export class AgentToolExecutorService implements IAgentToolExecutorService {
       const executePromise = execution.execute({
         turnId: options.turnId,
         toolCallId: call.toolCall.id,
+        taskBatchId: options.taskBatchId,
+        taskBatchCompletion: options.taskBatchCompletion,
         trace: options.trace,
         metadata,
         signal,
         steerSignal: options.steerSignal,
+        steerInterruptSignal: options.steerInterruptSignal,
         onUpdate: (update) => {
           if (signal.aborted) return;
           this.dispatchToolProgress(call, update, options);

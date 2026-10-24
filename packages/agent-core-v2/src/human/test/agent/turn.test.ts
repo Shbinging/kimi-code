@@ -165,10 +165,12 @@ function startRequestActor(requester: LlmRequester, signal: AbortSignal) {
     },
   });
   const failed: unknown[] = [];
+  const done: unknown[] = [];
   const actor = createActor(harness, { input: { signal } });
   actor.on('llm.failed.remote', (event) => failed.push(event));
+  actor.on('llm.done', (event) => done.push(event));
   actor.start();
-  return { failed };
+  return { failed, done };
 }
 
 async function flush(): Promise<void> {
@@ -743,6 +745,28 @@ describe('turn machine credential recovery', () => {
     await drain();
 
     expect(failed).toHaveLength(0);
+  });
+
+  it('drops a completion emitted after the request aborts', async () => {
+    const controller = new AbortController();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const requester: LlmRequester = {
+      generate: async (_config, _content, { onEvent }) => {
+        await blocked;
+        onEvent?.({ type: 'llm.done' });
+      },
+    };
+    const { failed, done } = startRequestActor(requester, controller.signal);
+
+    controller.abort();
+    release();
+    await drain();
+
+    expect(failed).toHaveLength(0);
+    expect(done).toHaveLength(0);
   });
 
   it('does not report llm.failed.remote when the signal is already aborted', async () => {

@@ -2522,13 +2522,9 @@ export class KimiTUI {
       'user',
     );
     const currentTurnId = this.streamingUI.getTurnContext().turnId;
-    // Skill steers may not merge into the current turn: an untracked active
-    // turn (e.g. a goal continuation) has no steerable prompt, so the engine
-    // queues the submission — and binding the lease here would release its
-    // media when that unrelated turn ends. Leave skill leases unclaimed so
-    // the submission's own turn.started claims them; a merged steer simply
-    // retires its media at session close instead.
-    if (currentTurnId !== undefined && prepared === undefined) this.staging.bindToTurn(stagingLease, currentTurnId);
+    // Steers also merge into untracked turns. Bind to the current turn so
+    // media is retired when that turn ends rather than at session close.
+    if (currentTurnId !== undefined) this.staging.bindToTurn(stagingLease, currentTurnId);
     const request = this.trackPendingEntries(
       steeredEntries,
       prepared === undefined
@@ -4189,8 +4185,12 @@ export class KimiTUI {
     for (const target of targets) {
       try {
         const info = await session.detachBackgroundTask(target.taskId);
-        if (info === undefined) alreadyFinished++;
-        else detached++;
+        if (info === undefined) {
+          alreadyFinished++;
+        } else {
+          detached++;
+          if (info.kind === 'agent') this.streamingUI.markSubagentBackgrounded(info.agentId);
+        }
       } catch (error) {
         this.showError(`Failed to detach ${target.taskId}: ${formatErrorMessage(error)}`);
       }

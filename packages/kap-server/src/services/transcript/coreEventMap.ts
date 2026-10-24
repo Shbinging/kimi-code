@@ -1063,6 +1063,15 @@ export class AgentTranscriptProjector {
     sourceKind: string;
     sourceId: string;
   }): TranscriptOperation[] {
+    if (
+      event.notificationType === 'task.batch_review' ||
+      (event.notificationType === 'task.completed' &&
+        event.sourceKind === 'background_task' &&
+        /^(?:agent|bash)-/.test(event.sourceId)) ||
+      (event.notificationType === 'task.batch_completed' && event.severity === 'info')
+    ) {
+      return [];
+    }
     const step = this.currentStep;
     const turn = this.currentTurn;
     if (turn === undefined || turn.state !== 'running') return [];

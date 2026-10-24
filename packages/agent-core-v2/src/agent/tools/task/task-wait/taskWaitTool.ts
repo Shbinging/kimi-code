@@ -10,7 +10,7 @@ import { registerAgentToolService } from '#/agent/toolRegistry/toolContribution'
 
 import { IAgentScopeContext } from '#/agent/scopeContext/scopeContext';
 import { IAgentTaskService } from '#/agent/task/task';
-import type { AgentTaskInfo, AgentTaskOutputSnapshot } from '#/agent/task/task';
+import type { AgentTaskBatchWaitResult, AgentTaskInfo, AgentTaskOutputSnapshot } from '#/agent/task/task';
 import { TERMINAL_STATUSES } from '#/agent/task/types';
 import { formatPlainObject, formatTaskRecord } from '#/agent/task/tools/format';
 import { formatTaskList } from '#/agent/tools/task/task-list/taskListTool';
@@ -141,11 +141,13 @@ export class WaitForTool implements IWaitForTool {
   resolveExecution(args: WaitForInput): ToolExecution {
     return {
       description:
-        args.task_id === undefined
-          ? `Waiting up to ${String(args.timeout)}s for any background task`
-          : `Waiting up to ${String(args.timeout)}s for task ${args.task_id}`,
+        args.batch_id !== undefined
+          ? `Waiting up to ${String(args.timeout)}s for batch ${args.batch_id}`
+          : args.task_id === undefined
+            ? `Waiting up to ${String(args.timeout)}s for any background task`
+            : `Waiting up to ${String(args.timeout)}s for task ${args.task_id}`,
       approvalRule: this.name,
-      matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.task_id ?? 'any'),
+      matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.task_id ?? args.batch_id ?? 'any'),
       execute: (ctx) => this.execute(args, ctx),
     };
   }
@@ -165,35 +167,42 @@ export class WaitForTool implements IWaitForTool {
     const timeoutMs = args.timeout * 1000;
     const runningAtStart = this.tasks.list(true);
 
-    if (args.task_id === undefined) {
-      if (runningAtStart.length === 0) {
-        this.track(args, startedAt, timeoutMs, 'completed', 0);
-        return {
-          output: this.withRepeatWarning(
-            [
-              formatPlainObject({ waitStatus: 'no_tasks', waitedMs: 0, timeoutMs }),
-              'No background tasks are running, so there is nothing to wait for. Finished tasks report back via automatic notification.',
-            ].join('\n\n'),
-            tally,
-          ),
-          isError: false,
-        };
+    if (args.batch_id === undefined) {
+      if (args.task_id === undefined) {
+        if (runningAtStart.length === 0) {
+          this.track(args, startedAt, timeoutMs, 'completed', 0);
+          return {
+            output: this.withRepeatWarning(
+              [
+                formatPlainObject({ waitStatus: 'no_tasks', waitedMs: 0, timeoutMs }),
+                'No background tasks are running, so there is nothing to wait for. Finished tasks report back via automatic notification.',
+              ].join('\n\n'),
+              tally,
+            ),
+            isError: false,
+          };
+        }
+      } else if (this.tasks.getTask(args.task_id) === undefined) {
+        this.track(args, startedAt, timeoutMs, 'task_not_found', 0);
+        return { isError: true, output: this.withRepeatWarning(`Task not found: ${args.task_id}`, tally) };
       }
-    } else if (this.tasks.getTask(args.task_id) === undefined) {
-      this.track(args, startedAt, timeoutMs, 'task_not_found', 0);
-      return { isError: true, output: this.withRepeatWarning(`Task not found: ${args.task_id}`, tally) };
     }
 
     let waited: AgentTaskInfo | undefined;
+    let waitedBatch: AgentTaskBatchWaitResult | undefined;
     const signal = ctx.steerSignal === undefined
       ? ctx.signal
       : AbortSignal.any([ctx.signal, ctx.steerSignal]);
     const progress = startWaitProgress(args, this.tasks, ctx.onUpdate, startedAt);
     try {
-      waited =
-        args.task_id === undefined
-          ? await this.waitAny(runningAtStart, timeoutMs, signal)
-          : await this.tasks.wait(args.task_id, timeoutMs, signal);
+      if (args.batch_id !== undefined) {
+        waitedBatch = await this.tasks.waitForNotificationGroup(args.batch_id, timeoutMs, signal);
+      } else {
+        waited =
+          args.task_id === undefined
+            ? await this.waitAny(runningAtStart, timeoutMs, signal)
+            : await this.tasks.wait(args.task_id, timeoutMs, signal);
+      }
     } catch (error) {
       if (
         !ctx.signal.aborted && ctx.steerSignal?.aborted &&
@@ -212,6 +221,26 @@ export class WaitForTool implements IWaitForTool {
       progress.stop();
     }
     tally.waitedMs += Date.now() - startedAt;
+
+    if (args.batch_id !== undefined) {
+      if (waitedBatch === undefined) {
+        this.track(args, startedAt, timeoutMs, 'task_not_found', 0);
+        return { isError: true, output: this.withRepeatWarning(`Batch not found: ${args.batch_id}`, tally) };
+      }
+      if (!waitedBatch.complete) {
+        this.track(args, startedAt, timeoutMs, 'timed_out', 0);
+        return {
+          output: this.withRepeatWarning(
+            this.formatBatchTimeout(args, waitedBatch.tasks, startedAt, timeoutMs),
+            tally,
+          ),
+          isError: false,
+        };
+      }
+      const output = await this.formatBatchCompleted(waitedBatch.tasks, args.batch_id, startedAt, timeoutMs);
+      this.track(args, startedAt, timeoutMs, 'completed', Math.max(0, waitedBatch.tasks.length - 1));
+      return { output: this.withRepeatWarning(output, tally), isError: false };
+    }
 
     if (waited === undefined) {
       this.track(args, startedAt, timeoutMs, 'task_not_found', 0);
@@ -318,12 +347,38 @@ export class WaitForTool implements IWaitForTool {
     return lines.join('\n');
   }
 
+  private formatBatchTimeout(
+    args: WaitForInput,
+    infos: readonly AgentTaskInfo[],
+    startedAt: number,
+    timeoutMs: number,
+  ): string {
+    const running = infos.filter((info) => !TERMINAL_STATUSES.has(info.status));
+    const lines = [
+      formatPlainObject({
+        waitStatus: 'timed_out',
+        batchId: args.batch_id,
+        waitedMs: Date.now() - startedAt,
+        timeoutMs,
+        taskCount: infos.length,
+      }),
+      'The wait ended before the whole batch finished; a timeout is not an error, and no tasks were stopped. Call WaitFor with the same batch_id again only if you still need the final results.',
+    ];
+    if (running.length > 0) {
+      lines.push('', '[still_running]', formatTaskList(running, true));
+    } else {
+      lines.push('', 'The batch has not finished registering its tasks.');
+    }
+    return lines.join('\n');
+  }
+
   private formatInterrupted(args: WaitForInput, startedAt: number, timeoutMs: number): string {
     const lines = [
       formatPlainObject({
         waitStatus: 'interrupted',
         reason: 'steer',
         taskId: args.task_id,
+        batchId: args.batch_id,
         waitedMs: Date.now() - startedAt,
         timeoutMs,
       }),
@@ -368,6 +423,31 @@ export class WaitForTool implements IWaitForTool {
     return lines.join('\n');
   }
 
+  private async formatBatchCompleted(
+    infos: readonly AgentTaskInfo[],
+    batchId: string,
+    startedAt: number,
+    timeoutMs: number,
+  ): Promise<string> {
+    const lines = [
+      formatPlainObject({
+        waitStatus: 'completed',
+        batchId,
+        waitedMs: Date.now() - startedAt,
+        timeoutMs,
+        taskCount: infos.length,
+      }),
+      '',
+      '[finished_batch]',
+    ];
+    const formatted = await Promise.all(infos.map((info) => this.formatFinishedTask(info)));
+    for (const [index, taskLines] of formatted.entries()) {
+      if (index > 0) lines.push('---');
+      lines.push(...taskLines);
+    }
+    return lines.join('\n');
+  }
+
   private async formatFinishedTask(info: AgentTaskInfo): Promise<string[]> {
     const output = await this.tasks.getOutputSnapshot(info.taskId, OUTPUT_PREVIEW_BYTES);
     const lines = [
@@ -407,7 +487,7 @@ export class WaitForTool implements IWaitForTool {
       outcome,
       timeout_ms: timeoutMs,
       waited_ms: Date.now() - startedAt,
-      has_task_id: args.task_id !== undefined,
+      has_task_id: args.task_id !== undefined || args.batch_id !== undefined,
       extra_completed_count: extraCompletedCount,
     });
   }

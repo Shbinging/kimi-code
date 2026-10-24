@@ -66,6 +66,9 @@ function renderBashDescription(shellName: string): string {
   return renderPrompt(bashDescriptionTemplate, { ...SHELL_TIMEOUT_VARS, SHELL_NAME: shellName });
 }
 
+const AUTO_BACKGROUND_CHECKPOINT_RE =
+  /\r?\n\r?\nAfter an automatic transition,[\s\S]*?no further periodic reviews are scheduled\./;
+
 function withoutBackgroundDescription(description: string): string {
   return description
     .replace(
@@ -73,9 +76,10 @@ function withoutBackgroundDescription(description: string): string {
       '\n\nBackground execution is disabled for this agent. Do not set `run_in_background=true`.',
     )
     .replace(
-      ` For possibly long-running foreground commands, set the \`timeout\` argument in seconds. Foreground commands default to ${String(DEFAULT_TIMEOUT_S)}s and allow up to ${String(MAX_TIMEOUT_S)}s. When a foreground command hits its timeout it is moved to the background instead of being killed, and you will be automatically notified when it completes.`,
-      ` For possibly long-running commands, set the \`timeout\` argument in seconds. The default is ${String(DEFAULT_TIMEOUT_S)}s; foreground commands allow up to ${String(MAX_TIMEOUT_S)}s; a foreground command that hits its timeout is killed.`,
+      ` Foreground commands move to the background after ${String(DEFAULT_TIMEOUT_S)}s by default, and you will be automatically notified when they complete.`,
+      ` Foreground commands are killed after ${String(DEFAULT_TIMEOUT_S)}s by default.`,
     )
+    .replace(AUTO_BACKGROUND_CHECKPOINT_RE, '')
     .replace(
       ' The user can also move a running foreground command to the background at any time.',
       '',
@@ -87,15 +91,18 @@ function withoutBackgroundDescription(description: string): string {
 }
 
 function withoutAutoBackgroundOnTimeout(description: string): string {
-  return description.replace(
-    ' When a foreground command hits its timeout it is moved to the background instead of being killed, and you will be automatically notified when it completes.',
-    ' A foreground command that hits its timeout is killed.',
-  );
+  return description
+    .replace(
+      ` Foreground commands move to the background after ${String(DEFAULT_TIMEOUT_S)}s by default, and you will be automatically notified when they complete.`,
+      ` Foreground commands are killed after ${String(DEFAULT_TIMEOUT_S)}s by default.`,
+    )
+    .replace(AUTO_BACKGROUND_CHECKPOINT_RE, '');
 }
 
 export class BashTool implements IBashTool {
   declare readonly _serviceBrand: undefined;
   readonly name = 'Bash' as const;
+  readonly allowSameStepDedupe = false;
   readonly parameters: Record<string, unknown> = toInputJsonSchema(BashInputSchema);
 
   constructor(
@@ -149,8 +156,8 @@ export class BashTool implements IBashTool {
       },
       approvalRule: literalRulePattern(this.name, args.command),
       matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.command),
-      execute: ({ signal, steerInterruptSignal, onUpdate, onForegroundTaskStart, toolCallId }) =>
-        this.execution(args, signal, toolCallId, steerInterruptSignal, onUpdate, onForegroundTaskStart),
+      execute: ({ signal, steerInterruptSignal, onUpdate, onForegroundTaskStart, toolCallId, taskBatchId, taskBatchCompletion, autoBackgroundOnTimeout }) =>
+        this.execution(args, signal, toolCallId, steerInterruptSignal, onUpdate, onForegroundTaskStart, taskBatchId, taskBatchCompletion, autoBackgroundOnTimeout),
     };
   }
 
@@ -179,18 +186,31 @@ export class BashTool implements IBashTool {
     steerInterruptSignal?: AbortSignal,
     onUpdate?: (update: ToolUpdate) => void,
     onForegroundTaskStart?: (taskId: string) => void,
+    taskBatchId?: string,
+    taskBatchCompletion?: Promise<void>,
+    allowAutoBackgroundOnTimeout = true,
   ): Promise<ExecutableToolResult> {
     const validationError = this.validateRunRequest(args, signal);
     if (validationError !== undefined) return validationError;
 
     const startsInBackground = args.run_in_background === true;
-    const foregroundTimeoutMs =
+    const configuredForegroundTimeoutMs =
       Math.min(
-        args.timeout ??
-          resolveAgentTaskConfig(this.config)?.bashForegroundTimeoutS ??
-          DEFAULT_TIMEOUT_S,
+        resolveAgentTaskConfig(this.config)?.bashForegroundTimeoutS ?? DEFAULT_TIMEOUT_S,
         MAX_TIMEOUT_S,
       ) * MS_PER_SECOND;
+    const requestedTimeoutMs =
+      args.timeout === undefined
+        ? undefined
+        : Math.min(args.timeout, MAX_TIMEOUT_S) * MS_PER_SECOND;
+    const autoBackgroundOnTimeout =
+      allowAutoBackgroundOnTimeout &&
+      this.allowBackground() &&
+      this.autoBackgroundOnTimeout() &&
+      (requestedTimeoutMs === undefined || requestedTimeoutMs > configuredForegroundTimeoutMs);
+    const foregroundTimeoutMs = autoBackgroundOnTimeout
+      ? configuredForegroundTimeoutMs
+      : (requestedTimeoutMs ?? configuredForegroundTimeoutMs);
     const lease = this.runtime.acquire(['process']);
     const view = new RuntimeWorkspaceView(lease.runtime, this.workspaceCtx);
     const env = lease.runtime.environment;
@@ -242,8 +262,15 @@ export class BashTool implements IBashTool {
         {
           detached: startsInBackground,
           timeoutMs,
-          detachTimeoutMs: this.detachTimeoutMs(),
-          autoBackgroundOnTimeout: this.allowBackground() && this.autoBackgroundOnTimeout(),
+          detachTimeoutMs:
+            autoBackgroundOnTimeout && requestedTimeoutMs !== undefined
+              ? requestedTimeoutMs - foregroundTimeoutMs
+              : this.detachTimeoutMs(),
+          autoBackgroundOnTimeout,
+          notificationGroupId:
+            autoBackgroundOnTimeout && !startsInBackground ? taskBatchId : undefined,
+          notificationGroupCompletion:
+            autoBackgroundOnTimeout && !startsInBackground ? taskBatchCompletion : undefined,
           signal: startsInBackground ? undefined : signal,
         },
       );
@@ -293,6 +320,7 @@ export class BashTool implements IBashTool {
           labels,
           builder,
           release === 'timeout_detached' ? 'foreground_detached' : 'foreground_detached_by_user',
+          release === 'timeout_detached' ? taskBatchId : undefined,
         );
       }
 
@@ -394,17 +422,19 @@ export class BashTool implements IBashTool {
     labels: { title: string; brief: string },
     builder = new ToolOutputAccumulator(),
     scenario: 'background_started' | 'foreground_detached' | 'foreground_detached_by_user' = 'background_started',
+    notificationGroupId?: string,
   ): ExecutableToolResult {
     const status = this.tasks.getTask(taskId)?.status ?? 'running';
     const detachedByUser = scenario === 'foreground_detached_by_user' ? 'detached_by_user: true\n' : '';
     const metadata =
       `task_id: ${taskId}\n` +
+      (notificationGroupId === undefined ? '' : `batch_id: ${notificationGroupId}\n`) +
       `pid: ${String(proc.pid)}\n` +
       `description: ${description}\n` +
       `status: ${status}\n` +
       detachedByUser +
       `automatic_notification: true\n` +
-      this.nextStepLines(scenario) +
+      this.nextStepLines(scenario, notificationGroupId) +
       'human_shell_hint: The task is visible in the background-task panel.';
 
     const foregroundResult = builder.ok('');
@@ -424,7 +454,11 @@ export class BashTool implements IBashTool {
 
   private nextStepLines(
     scenario: 'background_started' | 'foreground_detached' | 'foreground_detached_by_user',
+    notificationGroupId?: string,
   ): string {
+    if (scenario === 'foreground_detached' && notificationGroupId !== undefined) {
+      return `next_step: The task now runs in the background. Inspect the returned status and any foreground_output for early errors. Continue with other work if available. If none remains and you need the batch results, call WaitFor once with batch_id "${notificationGroupId}" and an appropriate timeout. The wait makes no LLM requests and can be interrupted by new input. This batch gets one progress review 30 seconds after backgrounding. Normal completion is bundled after every task finishes unless WaitFor already returned the results; a harness-detected hard failure arrives early. Do not create delay commands or poll to reproduce these notifications; no further periodic reviews are scheduled.\n`;
+    }
     if (scenario === 'foreground_detached' || scenario === 'foreground_detached_by_user') {
       const avoid = this.allowBackground()
         ? 'do NOT wait, poll, or call TaskOutput on it'

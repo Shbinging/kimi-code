@@ -467,9 +467,13 @@ function createFakeTaskService(
 
   const service: IAgentTaskService = {
     _serviceBrand: undefined,
+    markNotificationGroupDeliveredViaWait: vi.fn(),
+    waitForNotificationGroup: vi.fn(),
     track(): never {
       throw new Error('fake IAgentTaskService.track is not implemented');
     },
+
+    completeNotificationGroupRegistration(): void {},
 
     registerTask(task: AgentTask, registerOptions: RegisterAgentTaskOptions = {}): string {
       const detached = registerOptions.detached ?? true;
@@ -675,7 +679,10 @@ function context(
   args: BashInput,
   signal = new AbortController().signal,
   onForegroundTaskStart?: (taskId: string) => void,
-  signals?: Pick<ExecutableToolContext, 'steerSignal' | 'steerInterruptSignal'>,
+  signals?: Pick<
+    ExecutableToolContext,
+    'steerSignal' | 'steerInterruptSignal' | 'taskBatchId' | 'taskBatchCompletion'
+  >,
 ) {
   return { turnId: 0, toolCallId: 'call_bash', args, signal, onForegroundTaskStart, ...signals };
 }
@@ -814,13 +821,13 @@ describe('BashTool', () => {
     }
   });
 
-  it('exposes a default timeout in the JSON Schema', () => {
+  it('does not expose the foreground wait as the total timeout default', () => {
     const { runner } = createTestRunner(processWithOutput());
     const tool = bashTool(runner);
     const properties = (tool.parameters as { properties: Record<string, { default?: number }> })
       .properties;
 
-    expect(properties['timeout']?.default).toBe(5);
+    expect(properties['timeout']?.default).toBeUndefined();
   });
 
   it('renders the available commands section and the background-task panel hint', () => {
@@ -992,7 +999,7 @@ describe('BashTool', () => {
     }
   });
 
-  it('interprets small timeout values as seconds at runtime', async () => {
+  it('enforces a total timeout shorter than the foreground wait', async () => {
     vi.useFakeTimers();
     try {
       let resolveWait: (code: number) => void = () => {};
@@ -1013,14 +1020,13 @@ describe('BashTool', () => {
       expect(proc.kill).not.toHaveBeenCalled();
 
       await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(250);
       const result = await running;
 
-      expect(proc.kill).not.toHaveBeenCalled();
-      expect(result).toMatchObject({
-        isError: false,
-      });
-      expect(result.output).toContain('task_id: bash-');
-      resolveWait(0);
+      expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(result).toMatchObject({ isError: true, brief: 'Killed by timeout (2s)' });
+      expect(result.output).toContain('Command killed by timeout (2s)');
+      expect(result.output).not.toContain('task_id: bash-');
     } finally {
       vi.useRealTimers();
     }
@@ -1545,11 +1551,20 @@ describe('BashTool background mode', () => {
     try {
       const { proc, finish } = pendingProcess();
       const { runner } = createTestRunner(proc);
-      const { service } = createFakeTaskService();
+      const { service, tasks } = createFakeTaskService();
       const tool = bashTool(runner, createTestEnv(), createTestCtx(), service);
+      const taskBatchCompletion = Promise.resolve();
 
-      const running = executeTool(tool, context({ command: 'sleep 30', timeout: 1 }));
-      await vi.advanceTimersByTimeAsync(1_000);
+      const running = executeTool(
+        tool,
+        context({ command: 'sleep 30', timeout: 60 }, undefined, undefined, {
+          taskBatchId: 'turn-0:call_bash',
+          taskBatchCompletion,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      (proc.stdout as PassThrough).write('before checkpoint\n');
+      await vi.advanceTimersByTimeAsync(15_000);
       const result = await running;
 
       expect(proc.kill).not.toHaveBeenCalled();
@@ -1558,18 +1573,53 @@ describe('BashTool background mode', () => {
         brief: expect.stringContaining('after timeout'),
       });
       expect(result.output).toContain('The task now runs in the background.');
+      expect(result.output).toContain('Inspect the returned status and any foreground_output');
+      expect(result.output).toContain('one progress review 30 seconds after backgrounding');
+      expect(result.output).toContain('batch_id: turn-0:call_bash');
+      expect(result.output).toContain('call WaitFor once with batch_id "turn-0:call_bash"');
+      expect(result.output).toContain('Do not create delay commands');
+      expect(result.output).toContain('before checkpoint\n');
       expect(result.output).not.toContain('The user moved this task');
       expect(result.output).not.toContain('detached_by_user');
       expect(result.output).toContain('human_shell_hint: The task is visible in the background-task panel.');
       const taskId = /^task_id: (\S+)/m.exec(result.output as string)?.[1];
       expect(taskId).toBeDefined();
       expect(service.getTask(taskId!)).toMatchObject({ status: 'running', detached: true });
+      expect(tasks.get(taskId!)?.options).toMatchObject({
+        notificationGroupId: 'turn-0:call_bash',
+        notificationGroupCompletion: taskBatchCompletion,
+      });
 
       (proc.stdout as PassThrough).write('after timeout\n');
       finish(0);
       await vi.advanceTimersByTimeAsync(1);
       expect(service.getTask(taskId!)).toMatchObject({ status: 'completed' });
       await expect(service.readOutput(taskId!)).resolves.toContain('after timeout\n');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the explicit total timeout when detaching after the foreground wait', async () => {
+    vi.useFakeTimers();
+    try {
+      const { proc } = pendingProcess();
+      const { runner } = createTestRunner(proc);
+      const { service } = createFakeTaskService();
+      const tool = bashTool(runner, createTestEnv(), createTestCtx(), service);
+
+      const running = executeTool(tool, context({ command: 'sleep 300', timeout: 300 }));
+      await vi.advanceTimersByTimeAsync(15_000);
+      const result = await running;
+      const taskId = /^task_id: (\S+)/m.exec(result.output as string)?.[1];
+
+      expect(taskId).toBeDefined();
+      expect(proc.kill).not.toHaveBeenCalled();
+      expect(service.getTask(taskId!)).toMatchObject({ status: 'running', detached: true });
+      await vi.advanceTimersByTimeAsync(284_999);
+      expect(service.getTask(taskId!)?.status).toBe('running');
+      await vi.advanceTimersByTimeAsync(1);
+      expect(service.getTask(taskId!)?.status).toBe('timed_out');
     } finally {
       vi.useRealTimers();
     }
@@ -1676,20 +1726,30 @@ describe('BashTool background mode', () => {
   it('registers background commands and returns a task id', async () => {
     const proc = processWithOutput();
     const { runner } = createTestRunner(proc);
-    const { service } = createFakeTaskService();
+    const { service, tasks } = createFakeTaskService();
     const tool = bashTool(runner, createTestEnv(), createTestCtx(), service);
 
     const result = await executeTool(
       tool,
-      context({ command: 'sleep 10', run_in_background: true, description: 'long running task' }),
+      context(
+        { command: 'sleep 10', run_in_background: true, description: 'long running task' },
+        undefined,
+        undefined,
+        { taskBatchId: 'turn-0:call_bash', taskBatchCompletion: Promise.resolve() },
+      ),
     );
 
     expect(result.output).toMatch(/task_id: bash-[0-9a-z]{8}/);
     expect(result.output).toContain('automatic_notification: true');
     expect((result as { brief?: string }).brief).toMatch(/^Started bash-[0-9a-z]{8}$/);
     expect(result.output).toContain('do NOT wait, poll, or call TaskOutput on it');
+    expect(result.output).not.toContain('one progress review 30 seconds');
     expect(result.output).not.toContain('block=false');
     expect(service.list(false)).toHaveLength(1);
+    expect(tasks.get(service.list(false)[0]!.taskId)?.options).toMatchObject({
+      notificationGroupId: undefined,
+      notificationGroupCompletion: undefined,
+    });
   });
 
   it('kills a spawned background command when the task limit is reached', async () => {

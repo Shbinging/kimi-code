@@ -142,8 +142,7 @@ describe('promptWithSkills', () => {
 
   it('steers the bundled submission into the running turn without starting a new one', async () => {
     ctx = agentWithSkills();
-    ctx.mockNextResponse({ type: 'text', text: 'first reply' });
-    ctx.mockNextResponse({ type: 'text', text: 'second reply' });
+    ctx.mockNextResponse({ type: 'text', text: 'after steer' });
     const hold = holdFirstStep();
 
     const promptPromise = ctx.rpc.prompt({ input: [{ type: 'text', text: 'start' }] });
@@ -162,18 +161,21 @@ describe('promptWithSkills', () => {
     await promptPromise;
     await ctx.untilTurnEnd();
 
-    expect(ctx.llmCalls).toHaveLength(2);
+    expect(ctx.llmCalls).toHaveLength(1);
     const llmInput = JSON.stringify(ctx.llmInputs());
     expect(llmInput).toContain('# Review body');
     expect(llmInput).toContain('ARGUMENTS: src/app.ts');
     expect(llmInput).toContain('/review src/app.ts');
+    expect(ctx.context.get().at(-1)?.content).toEqual([{ type: 'text', text: 'after steer' }]);
 
-    const bundled = ctx.context
+    const bundledMessages = ctx.context
       .get()
-      .find(
+      .filter(
         (message) =>
           message.origin?.kind === 'user' && message.origin.skillActivations !== undefined,
       );
+    expect(bundledMessages).toHaveLength(1);
+    const bundled = bundledMessages[0];
     expect(bundled?.origin).toMatchObject({
       kind: 'user',
       inTurn: true,
@@ -191,6 +193,43 @@ describe('promptWithSkills', () => {
         (event.event === 'skill.activated' || event.event === 'turn.started'),
     );
     expect(events.map((event) => event.event)).toEqual(['turn.started', 'skill.activated']);
+  });
+
+  it('reports a bundled steer as running in a task-origin turn', async () => {
+    ctx = agentWithSkills();
+    ctx.mockNextResponse({ type: 'text', text: 'task response' });
+    ctx.mockNextResponse({ type: 'text', text: 'after steer' });
+    const hold = holdFirstStep();
+    const loop = ctx.get(IAgentLoopService);
+    loop.notify({
+      message: {
+        role: 'user',
+        id: 'task-turn',
+        content: [{ type: 'text', text: 'background update' }],
+        toolCalls: [],
+        origin: {
+          kind: 'task',
+          taskId: 'bash-1',
+          status: 'running',
+          notificationId: 'task:bash-1:running',
+        },
+      },
+      turnScoped: false,
+    });
+    await hold.started;
+
+    const steered = await ctx.rpc.promptWithSkills({
+      input: [{ type: 'text', text: '/review src/app.ts' }],
+      skills: [{ name: 'review', args: 'src/app.ts' }],
+      steerIfActive: true,
+    });
+    expect(steered).toMatchObject({ turn_id: 0, state: 'running' });
+
+    hold.release();
+    await ctx.untilTurnEnd();
+    const llmInput = JSON.stringify(ctx.llmInputs());
+    expect(llmInput).toContain('# Review body');
+    expect(llmInput).toContain('/review src/app.ts');
   });
 
   it.each([{ steerIfActive: undefined }, { steerIfActive: false }])(

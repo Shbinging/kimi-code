@@ -599,6 +599,33 @@ describe('AgentTaskService', () => {
     }).toThrow('Too many background tasks are already running.');
   });
 
+  it('counts auto-background eligible foreground tasks against the detached task limit', () => {
+    const { manager } = createAgentTaskService({ maxRunningTasks: 1 });
+    manager.registerTask(agentTask(new Promise(() => {}), 'automatic agent'), {
+      detached: false,
+      autoBackgroundOnTimeout: true,
+    });
+
+    expect(() => {
+      manager.registerTask(agentTask(new Promise(() => {}), 'background agent'));
+    }).toThrow('Too many background tasks are already running.');
+  });
+
+  it('reserves detached task capacity when registering auto-background eligible tasks', () => {
+    const { manager } = createAgentTaskService({ maxRunningTasks: 1 });
+    manager.registerTask(agentTask(new Promise(() => {}), 'first automatic agent'), {
+      detached: false,
+      autoBackgroundOnTimeout: true,
+    });
+
+    expect(() => {
+      manager.registerTask(agentTask(new Promise(() => {}), 'second automatic agent'), {
+        detached: false,
+        autoBackgroundOnTimeout: true,
+      });
+    }).toThrow('Too many background tasks are already running.');
+  });
+
   it('lists active tasks by default', () => {
     const { manager } = createAgentTaskService();
     registerProcess(manager, pendingProcess().proc, 'sleep 60', 'task 1');

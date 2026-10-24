@@ -82,6 +82,7 @@ import {
 import { applyPrintModeConfigDefaults } from '#/agent/task/printDefaults';
 import '#/session/subagent/configSection';
 import {
+  DEFAULT_SUBAGENT_AUTO_BACKGROUND_AFTER_MS,
   DEFAULT_SUBAGENT_TIMEOUT_MS,
   resolveSubagentBinding,
   resolveSubagentModelPool,
@@ -2105,6 +2106,7 @@ describe('subagent config section', () => {
     delete env[SUBAGENT_TIMEOUT_ENV];
     expect(config.get<SubagentConfig>(SUBAGENT_SECTION)).toEqual({
       timeoutMs: DEFAULT_SUBAGENT_TIMEOUT_MS,
+      autoBackgroundAfterMs: DEFAULT_SUBAGENT_AUTO_BACKGROUND_AFTER_MS,
     });
 
     disposables.dispose();

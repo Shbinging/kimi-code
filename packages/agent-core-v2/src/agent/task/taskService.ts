@@ -53,6 +53,7 @@ import {
   IAgentTaskService,
   type AgentTaskLoadOptions,
   type AgentTask,
+  type AgentTaskBatchWaitResult,
   type AgentTaskInfo,
   type AgentTaskOutputSnapshot,
   type AgentTaskStatus,
@@ -93,6 +94,12 @@ interface AgentTaskNotificationBuildContext {
   readonly origin: TaskOrigin;
   readonly notification: AgentTaskNotification;
 }
+
+interface NotificationGroupBuildContext extends AgentTaskNotificationBuildContext {
+  readonly taskInfos: readonly AgentTaskInfo[];
+}
+
+type NotificationGroupPhase = 'review' | 'failure' | 'completion';
 
 export const taskNotificationDeliveryKey = defineState(
   'task.notificationDelivery',
@@ -149,6 +156,22 @@ interface ManagedTask {
   handleSubscription?: { dispose(): void };
 }
 
+interface NotificationGroup {
+  readonly id: string;
+  readonly taskIds: Set<string>;
+  readonly detachedTaskIds: Set<string>;
+  registrationComplete: boolean;
+  registrationCompletionObserved: boolean;
+  readonly registrationCompletion: Promise<void>;
+  readonly resolveRegistration: () => void;
+  notificationQueue: Promise<void>;
+  reviewTimer?: ReturnType<typeof setTimeout>;
+  reviewSent: boolean;
+  failureSent: boolean;
+  completionSent: boolean;
+}
+
+const FOREGROUND_BATCH_REVIEW_MS = 30_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 const TERMINAL_OUTPUT_TAIL_BYTES = 4 * 1024;
@@ -214,6 +237,7 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
   declare readonly _serviceBrand: undefined;
 
   private readonly tasks = new Map<string, ManagedTask>();
+  private readonly notificationGroups = new Map<string, NotificationGroup>();
   private exitSuppressionArmed = false;
   private readonly buildingNotificationKeys = new Set<string>();
   private readonly pendingNotificationRequests = new Map<string, LoopNotifyHandle>();
@@ -356,9 +380,10 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
       timeoutMs,
       detachTimeoutMs: options.detachTimeoutMs,
       autoBackgroundOnTimeout: options.autoBackgroundOnTimeout,
+      notificationGroupId: options.notificationGroupId,
       signal: detached ? undefined : options.signal,
     };
-    this.assertCanRegister(detached);
+    this.assertCanRegister(detached, options.autoBackgroundOnTimeout);
     const entry: ManagedTask = {
       taskId: generateTaskId(task.idPrefix),
       task,
@@ -385,6 +410,41 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     };
     this.tasks.set(entry.taskId, entry);
     this.ghosts.delete(entry.taskId);
+    if (
+      !detached &&
+      options.autoBackgroundOnTimeout === true &&
+      options.notificationGroupId !== undefined
+    ) {
+      const groupId = options.notificationGroupId;
+      let group = this.notificationGroups.get(groupId);
+      if (group === undefined) {
+        let resolveRegistration!: () => void;
+        const registrationCompletion = new Promise<void>((resolve) => {
+          resolveRegistration = resolve;
+        });
+        group = {
+          id: groupId,
+          taskIds: new Set(),
+          detachedTaskIds: new Set(),
+          registrationComplete: false,
+          registrationCompletionObserved: false,
+          registrationCompletion,
+          resolveRegistration,
+          notificationQueue: Promise.resolve(),
+          reviewSent: false,
+          failureSent: false,
+          completionSent: false,
+        };
+        this.notificationGroups.set(groupId, group);
+      }
+      group.taskIds.add(entry.taskId);
+      if (!group.registrationCompletionObserved && options.notificationGroupCompletion !== undefined) {
+        group.registrationCompletionObserved = true;
+        void options.notificationGroupCompletion.then(() => {
+          this.completeNotificationGroupRegistration(groupId);
+        });
+      }
+    }
 
     if (timeoutMs !== undefined && timeoutMs > 0) {
       this.armManagerTimeout(entry, timeoutMs);
@@ -423,6 +483,14 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
       this.recordTaskStarted(this.toInfo(entry));
     }
     return entry.taskId;
+  }
+
+  completeNotificationGroupRegistration(groupId: string): void {
+    const group = this.notificationGroups.get(groupId);
+    if (group === undefined || group.registrationComplete) return;
+    group.registrationComplete = true;
+    group.resolveRegistration();
+    this.maybeCompleteNotificationGroup(group);
   }
 
   track(handle: ITaskHandle, options: AgentTaskTrackOptions): IAgentTaskEntry {
@@ -643,6 +711,27 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     );
   }
 
+  markNotificationGroupDeliveredViaWait(groupId: string): void {
+    const group = this.notificationGroups.get(groupId);
+    if (group === undefined || !group.registrationComplete) return;
+    const infos = this.notificationGroupInfos(group);
+    if (infos.length === 0 || infos.some((info) => !TERMINAL_STATUSES.has(info.status))) return;
+    this.markTasksDeliveredViaWait(
+      infos.map((info) => ({ taskId: info.taskId, status: info.status })),
+    );
+    const keys: string[] = [];
+    for (const phase of ['review', 'failure', 'completion'] as const) {
+      const origin = buildNotificationGroupOrigin(group.id, phase, infos);
+      const key = notificationKey(origin);
+      this.pendingNotificationRequests.get(key)?.drop();
+      this.markDeliveredNotification(origin);
+      keys.push(key);
+    }
+    void this.dispatcher.dispatch(
+      new TaskWaitDelivered({ agentId: this.scopeContext.agentId, keys }),
+    );
+  }
+
   detach(taskId: string): AgentTaskInfo | undefined {
     const entry = this.tasks.get(taskId);
     if (entry === undefined) return this.ghosts.get(taskId);
@@ -659,6 +748,16 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     entry.foregroundSignalCleanup?.();
     entry.foregroundSignalCleanup = undefined;
     this.applyDetachTimeout(entry);
+    const groupId = entry.options.notificationGroupId;
+    const group = groupId === undefined ? undefined : this.notificationGroups.get(groupId);
+    if (viaTimeout && group !== undefined) {
+      group.detachedTaskIds.add(entry.taskId);
+      this.armNotificationGroupReview(group);
+    } else if (group !== undefined) {
+      group.taskIds.delete(entry.taskId);
+      this.maybeDeleteNotificationGroup(group);
+      this.maybeCompleteNotificationGroup(group);
+    }
     try {
       const onDetach =
         entry.onDetachFn ??
@@ -671,6 +770,116 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     this.recordTaskStarted(this.toInfo(entry));
     foregroundRelease.resolve(viaTimeout ? 'timeout_detached' : 'detached');
     return this.toInfo(entry);
+  }
+
+  private armNotificationGroupReview(group: NotificationGroup): void {
+    if (
+      group.reviewTimer !== undefined ||
+      group.reviewSent ||
+      group.failureSent ||
+      group.completionSent
+    ) {
+      return;
+    }
+    group.reviewTimer = setClampedTimeout(() => {
+      group.reviewTimer = undefined;
+      if (group.reviewSent || group.failureSent || group.completionSent) return;
+      const hasRunningTasks = this.notificationGroupInfos(group).some(
+        (info) => !TERMINAL_STATUSES.has(info.status),
+      );
+      if (!hasRunningTasks) return;
+      group.reviewSent = true;
+      this.queueNotificationGroup(group, 'review');
+    }, FOREGROUND_BATCH_REVIEW_MS);
+    group.reviewTimer.unref?.();
+  }
+
+  private maybeDeleteNotificationGroup(group: NotificationGroup): void {
+    if (group.taskIds.size > 0 || group.detachedTaskIds.size > 0) return;
+    this.clearNotificationGroupReview(group);
+    this.notificationGroups.delete(group.id);
+  }
+
+  private clearNotificationGroupReview(group: NotificationGroup): void {
+    if (group.reviewTimer === undefined) return;
+    clearTimeout(group.reviewTimer);
+    group.reviewTimer = undefined;
+  }
+
+  private notificationGroupInfos(group: NotificationGroup): AgentTaskInfo[] {
+    const infos: AgentTaskInfo[] = [];
+    for (const taskId of group.detachedTaskIds) {
+      const entry = this.tasks.get(taskId);
+      if (entry !== undefined) infos.push(this.toInfo(entry));
+    }
+    return infos;
+  }
+
+  private maybeCompleteNotificationGroup(group: NotificationGroup): void {
+    if (!group.registrationComplete || group.completionSent) return;
+    if (group.detachedTaskIds.size === 0) {
+      this.maybeDeleteNotificationGroup(group);
+      return;
+    }
+    for (const taskId of group.taskIds) {
+      const entry = this.tasks.get(taskId);
+      if (entry === undefined) return;
+      if (!group.detachedTaskIds.has(taskId) && !TERMINAL_STATUSES.has(entry.status)) return;
+    }
+    const infos = this.notificationGroupInfos(group);
+    if (infos.some((info) => !TERMINAL_STATUSES.has(info.status))) return;
+    group.completionSent = true;
+    this.clearNotificationGroupReview(group);
+    this.queueNotificationGroup(group, 'completion');
+  }
+
+  private failNotificationGroup(group: NotificationGroup, info: AgentTaskInfo): void {
+    if (
+      info.status === 'completed' ||
+      group.failureSent ||
+      group.completionSent ||
+      this.isTerminalNotificationSuppressed(info.taskId)
+    ) {
+      return;
+    }
+    group.failureSent = true;
+    this.clearNotificationGroupReview(group);
+    this.queueNotificationGroup(group, 'failure');
+  }
+
+  private queueNotificationGroup(
+    group: NotificationGroup,
+    phase: NotificationGroupPhase,
+  ): void {
+    group.notificationQueue = group.notificationQueue
+      .then(async () => {
+        if (phase !== 'completion' && group.completionSent) return;
+        if (phase === 'review' && group.failureSent) return;
+        await this.notifyNotificationGroup(group, phase);
+      })
+      .catch((error: unknown) => {
+        if (phase === 'review') group.reviewSent = false;
+        this.scheduledNotificationKeys.delete(
+          notificationKey(
+            buildNotificationGroupOrigin(group.id, phase, this.notificationGroupInfos(group)),
+          ),
+        );
+        this.log.error('task batch notification delivery failed', {
+          groupId: group.id,
+          phase,
+          error,
+        });
+        if (phase === 'review') return;
+        for (const info of this.notificationGroupInfos(group)) {
+          if (!TERMINAL_STATUSES.has(info.status)) continue;
+          void this.notifyAgentTask(info).catch((fallbackError: unknown) => {
+            this.log.error('task notification delivery failed after batch fallback', {
+              taskId: info.taskId,
+              error: fallbackError,
+            });
+          });
+        }
+      });
   }
 
   private applyDetachTimeout(entry: ManagedTask): void {
@@ -819,6 +1028,9 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
   }
 
   override dispose(): void {
+    for (const group of this.notificationGroups.values()) {
+      this.clearNotificationGroupReview(group);
+    }
     if (!this.keepAliveOnExit()) {
       for (const entry of this.tasks.values()) {
         if (TERMINAL_STATUSES.has(entry.status)) continue;
@@ -902,6 +1114,41 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     return this.toInfo(entry);
   }
 
+  async waitForNotificationGroup(
+    groupId: string,
+    timeoutMs = 30_000,
+    signal?: AbortSignal,
+  ): Promise<AgentTaskBatchWaitResult | undefined> {
+    const group = this.notificationGroups.get(groupId);
+    if (group === undefined) return undefined;
+    const deadline = Date.now() + timeoutMs;
+    if (!group.registrationComplete && timeoutMs > 0) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const pending = Promise.race([
+          group.registrationCompletion,
+          new Promise<void>((resolve) => {
+            timeout = setClampedTimeout(resolve, timeoutMs);
+            timeout.unref?.();
+          }),
+        ]);
+        await (signal === undefined ? pending : abortable(pending, signal));
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
+    }
+    const remainingMs = Math.max(0, deadline - Date.now());
+    const infos = await Promise.all(
+      [...group.taskIds].map((taskId) => this.wait(taskId, remainingMs, signal)),
+    );
+    const tasks = infos.filter((info): info is AgentTaskInfo => info !== undefined);
+    const complete =
+      group.registrationComplete &&
+      tasks.every((info) => TERMINAL_STATUSES.has(info.status));
+    if (complete) this.markNotificationGroupDeliveredViaWait(groupId);
+    return { tasks, complete };
+  }
+
   async waitForForegroundRelease(
     taskId: string,
   ): Promise<ForegroundTaskReleaseReason | undefined> {
@@ -926,10 +1173,10 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     return reason;
   }
 
-  private assertCanRegister(detached: boolean): void {
+  private assertCanRegister(detached: boolean, autoBackgroundOnTimeout = false): void {
     const maxRunningTasks = resolveAgentTaskConfig(this.config)?.maxRunningTasks;
     if (maxRunningTasks === undefined) return;
-    if (!detached) return;
+    if (!detached && !autoBackgroundOnTimeout) return;
     if (this.activeTaskCount() < maxRunningTasks) return;
     throw new Error2(ErrorCodes.TASK_LIMIT_EXCEEDED, 'Too many background tasks are already running.', {
       details: { running: this.activeTaskCount(), max: maxRunningTasks },
@@ -939,7 +1186,12 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
   private activeTaskCount(): number {
     let count = 0;
     for (const entry of this.tasks.values()) {
-      if (!TERMINAL_STATUSES.has(entry.status) && this.startsDetached(entry)) count++;
+      if (
+        !TERMINAL_STATUSES.has(entry.status) &&
+        (this.startsDetached(entry) || entry.options.autoBackgroundOnTimeout === true)
+      ) {
+        count++;
+      }
     }
     return count;
   }
@@ -1084,12 +1336,27 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
 
   private fireTerminalEffects(entry: ManagedTask): void {
     if (entry.terminalFired) return;
-    if (!this.isDetached(entry)) return;
     entry.terminalFired = true;
+    const groupId = entry.options.notificationGroupId;
+    const group = groupId === undefined ? undefined : this.notificationGroups.get(groupId);
+    const grouped = group?.detachedTaskIds.has(entry.taskId) === true;
+    if (!grouped) group?.taskIds.delete(entry.taskId);
+    if (!this.isDetached(entry)) {
+      if (group !== undefined) {
+        this.maybeDeleteNotificationGroup(group);
+        this.maybeCompleteNotificationGroup(group);
+      }
+      return;
+    }
     const info = this.toInfo(entry);
-    void this.notifyAgentTask(info).catch((error) => {
-      this.log.error('task notification delivery failed', { taskId: info.taskId, error });
-    });
+    if (grouped && group !== undefined) {
+      this.maybeCompleteNotificationGroup(group);
+      this.failNotificationGroup(group, info);
+    } else {
+      void this.notifyAgentTask(info).catch((error) => {
+        this.log.error('task notification delivery failed', { taskId: info.taskId, error });
+      });
+    }
     this.recordTaskTerminated(info, this.retainedOutputTail(entry));
   }
 
@@ -1172,10 +1439,154 @@ export class AgentTaskService extends Disposable implements IAgentTaskService {
     return restore;
   }
 
+  private async notifyNotificationGroup(
+    group: NotificationGroup,
+    phase: NotificationGroupPhase,
+  ): Promise<void> {
+    if (!this.lifecycleActive()) {
+      this.log.warn('task batch notification skipped: agent lifecycle inactive', {
+        groupId: group.id,
+        phase,
+      });
+      return;
+    }
+    const context = await this.buildNotificationGroupContext(group, phase);
+    if (context === undefined) return;
+    if (!this.lifecycleActive() || this.exitSuppressionArmed) {
+      this.log.warn('task batch notification dropped before scheduling', { groupId: group.id });
+      return;
+    }
+    const key = notificationKey(context.origin);
+    if (this.deliveredNotificationKeys.has(key)) return;
+    const handle = this.loop.notify({
+      message: {
+        role: 'user',
+        content: [...context.content],
+        toolCalls: [],
+        origin: context.origin,
+      },
+      turnScoped: false,
+      onConsume: () => {
+        this.pendingNotificationRequests.delete(key);
+        this.markNotificationGroupTasksDelivered(context.taskInfos);
+        this.fireNotificationHook(context.notification);
+      },
+      onDrop: () => this.clearPendingNotification(key, handle),
+    });
+    this.pendingNotificationRequests.set(key, handle);
+  }
+
+  private async buildNotificationGroupContext(
+    group: NotificationGroup,
+    phase: NotificationGroupPhase,
+  ): Promise<NotificationGroupBuildContext | undefined> {
+    const infos = this.notificationGroupInfos(group);
+    if (infos.length === 0) return undefined;
+    const origin = buildNotificationGroupOrigin(group.id, phase, infos);
+    const key = notificationKey(origin);
+    if (this.buildingNotificationKeys.has(key)) return undefined;
+    if (this.scheduledNotificationKeys.has(key)) return undefined;
+    if (this.deliveredNotificationKeys.has(key)) return undefined;
+    if (this.hasDeliveredNotification(key)) return undefined;
+    this.buildingNotificationKeys.add(key);
+    try {
+      const outputs = await Promise.all(
+        infos.map(async (info) => {
+          try {
+            return await this.getOutputSnapshot(info.taskId, NOTIFICATION_FALLBACK_PREVIEW_BYTES);
+          } catch (error) {
+            this.log.error('task batch notification output read failed; delivering without output', {
+              taskId: info.taskId,
+              error,
+            });
+            return emptyOutputSnapshot();
+          }
+        }),
+      );
+      if (this.exitSuppressionArmed) return undefined;
+      if (this.scheduledNotificationKeys.has(key)) return undefined;
+      if (this.deliveredNotificationKeys.has(key)) return undefined;
+      if (this.hasDeliveredNotification(key)) return undefined;
+      this.scheduledNotificationKeys.add(key);
+      const notification = buildNotificationGroupNotification(group.id, phase, infos, outputs);
+      const content = [
+        {
+          type: 'text',
+          text: renderNotificationXml(notification),
+        },
+      ] as const;
+      return { content, origin, notification, taskInfos: infos };
+    } finally {
+      this.buildingNotificationKeys.delete(key);
+    }
+  }
+
+  private markNotificationGroupTasksDelivered(infos: readonly AgentTaskInfo[]): void {
+    const keys: string[] = [];
+    for (const info of infos) {
+      if (!TERMINAL_STATUSES.has(info.status)) continue;
+      const origin: TaskNotificationOrigin = {
+        taskId: info.taskId,
+        status: info.status,
+        notificationId: taskNotificationId(info.taskId, info.status),
+      };
+      const key = notificationKey(origin);
+      this.pendingNotificationRequests.get(key)?.drop();
+      this.markDeliveredNotification(origin);
+      keys.push(key);
+    }
+    if (keys.length === 0) return;
+    void this.dispatcher.dispatch(
+      new TaskWaitDelivered({ agentId: this.scopeContext.agentId, keys }),
+    );
+  }
+
+  private async restoreNotificationGroup(
+    group: NotificationGroup,
+    phase: NotificationGroupPhase,
+  ): Promise<void> {
+    const context = await this.buildNotificationGroupContext(group, phase);
+    if (context === undefined) return;
+    this.context.append({
+      role: 'user',
+      content: [...context.content],
+      toolCalls: [],
+      origin: context.origin,
+    });
+    this.markNotificationGroupTasksDelivered(context.taskInfos);
+    this.fireNotificationHook(context.notification);
+  }
+
   private async restoreAgentTaskNotificationsNow(): Promise<void> {
+    const restoredGroupIds = new Set<string>();
+    for (const group of this.notificationGroups.values()) {
+      const phase = group.completionSent
+        ? ('completion' as const)
+        : group.failureSent
+          ? ('failure' as const)
+          : group.reviewSent
+            ? ('review' as const)
+            : undefined;
+      if (phase === undefined) continue;
+      const infos = this.notificationGroupInfos(group);
+      if (infos.length === 0) continue;
+      if (phase === 'completion' && infos.some((info) => !TERMINAL_STATUSES.has(info.status))) {
+        continue;
+      }
+      if (phase !== 'completion' && infos.every((info) => TERMINAL_STATUSES.has(info.status))) {
+        continue;
+      }
+      restoredGroupIds.add(group.id);
+      await this.restoreNotificationGroup(group, phase);
+    }
     for (const info of this.list(false)) {
       if (!isAgentTaskTerminal(info.status)) continue;
       if (info.status === 'lost') continue;
+      const groupId = this.tasks.get(info.taskId)?.options.notificationGroupId;
+      const group = groupId === undefined ? undefined : this.notificationGroups.get(groupId);
+      if (group?.detachedTaskIds.has(info.taskId) === true && restoredGroupIds.has(group.id)) {
+        continue;
+      }
       await this.restoreAgentTaskNotification(info);
     }
   }
@@ -1605,6 +2016,90 @@ function buildAgentTaskNotificationBody(info: AgentTaskInfo): string {
   ].join('\n');
 
   return `${timed}${recovery}`;
+}
+
+function buildNotificationGroupOrigin(
+  groupId: string,
+  phase: NotificationGroupPhase,
+  infos: readonly AgentTaskInfo[],
+): TaskOrigin {
+  const failed = infos.some(
+    (info) => TERMINAL_STATUSES.has(info.status) && info.status !== 'completed',
+  );
+  return {
+    kind: 'task',
+    taskId: groupId,
+    status: phase === 'review' ? 'running' : failed ? 'failed' : 'completed',
+    notificationId: `task-group:${groupId}:${phase}`,
+  };
+}
+
+function buildNotificationGroupNotification(
+  groupId: string,
+  phase: NotificationGroupPhase,
+  infos: readonly AgentTaskInfo[],
+  outputs: readonly AgentTaskOutputSnapshot[],
+): AgentTaskNotification {
+  const running = infos.filter((info) => !TERMINAL_STATUSES.has(info.status)).length;
+  const failed = infos.filter(
+    (info) => TERMINAL_STATUSES.has(info.status) && info.status !== 'completed',
+  ).length;
+  const origin = buildNotificationGroupOrigin(groupId, phase, infos);
+  const title =
+    phase === 'review'
+      ? 'Background batch progress'
+      : phase === 'failure'
+        ? 'Background batch failed'
+        : failed > 0
+          ? 'Background batch finished with failures'
+          : 'Background batch completed';
+  const body =
+    phase === 'review'
+      ? `${String(running)} of ${String(infos.length)} automatically backgrounded tasks are still running at the 30-second checkpoint. Inspect each task's status and output below. Continue with other work if available. If none remains and you need the final results, call WaitFor once with batch_id "${groupId}" and an appropriate timeout. Waiting makes no LLM requests and can be interrupted by new input. This is the only scheduled progress review; do not create delay commands or poll to reproduce it. A hard failure will arrive early; otherwise the final batch notification arrives after all tasks finish unless WaitFor already returned the results.`
+      : phase === 'failure'
+        ? 'A task in this batch reached a hard failure. Review the task states and outputs below. Other tasks may still be running; their terminal states arrive in the final batch notification or a WaitFor batch result.'
+        : failed > 0
+          ? `All ${String(infos.length)} automatically backgrounded tasks reached a terminal state; ${String(failed)} did not complete successfully. Review their final states and outputs below.`
+          : `All ${String(infos.length)} automatically backgrounded tasks completed. Review their final states and outputs below.`;
+  return {
+    id: origin.notificationId,
+    category: 'task',
+    type:
+      phase === 'review'
+        ? 'task.batch_review'
+        : failed > 0
+          ? 'task.batch_failed'
+          : 'task.batch_completed',
+    source_kind: 'background_task',
+    source_id: groupId,
+    title,
+    severity: failed > 0 ? 'warning' : 'info',
+    body,
+    children: infos.map((info, index) =>
+      renderNotificationGroupTask(info, outputs[index] ?? emptyOutputSnapshot()),
+    ),
+  };
+}
+
+function renderNotificationGroupTask(
+  info: AgentTaskInfo,
+  output: AgentTaskOutputSnapshot,
+): string {
+  const lines = [
+    `<task task_id="${escapeXmlAttr(info.taskId)}" kind="${escapeXmlAttr(info.kind)}" status="${escapeXmlAttr(info.status)}">`,
+    escapeXmlTags(buildAgentTaskNotificationBody(info)),
+    `<output-preview bytes="${String(output.previewBytes)}" total_bytes="${String(output.outputSizeBytes)}" truncated="${String(output.truncated)}">`,
+    output.truncated
+      ? `Showing the last ${String(output.previewBytes)} bytes of task output.`
+      : 'Current task output.',
+    escapeXml(output.preview),
+    '</output-preview>',
+  ];
+  if (output.fullOutputAvailable && output.outputPath !== undefined) {
+    lines.push(renderOutputFileBlock(output.outputPath, output.outputSizeBytes));
+  }
+  lines.push('</task>');
+  return lines.join('\n');
 }
 
 function buildAgentTaskNotification(

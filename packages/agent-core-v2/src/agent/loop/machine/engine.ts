@@ -262,7 +262,7 @@ function createDeltaSplitter(): (part: StreamedMessagePart) => MachineEngineDelt
 
 export type MachineEngineAttachRef = Pick<
   Actor<ReturnType<typeof createAgentMachine>>,
-  'on' | 'send' | 'getSnapshot'
+  'on' | 'send' | 'getSnapshot' | 'subscribe'
 >;
 
 export const MACHINE_LOOP_MODEL: LlmModel = {
@@ -532,7 +532,7 @@ export function attachMachineEngine(
     resume: () => {
       ref.send({ type: 'input.continue' });
     },
-    resetHistory: (history) => {
+    resetHistory: async (history) => {
       const events: ExternalEvent[] = history.map((message) => messageAppended({ message }));
       const nextTurnId = (ref.getSnapshot() as unknown as MachineSnapshotLike).context.turnId;
       if (nextTurnId > 0) {
@@ -540,7 +540,30 @@ export function attachMachineEngine(
       }
       const seed = seedRecords(events);
       const next = currentJournal === undefined ? seed : seededStoreJournal(currentJournal, seed.readSync());
-      return store.reset(next);
+      let resolveApplied!: () => void;
+      let rejectStopped!: (reason?: unknown) => void;
+      const applied = new Promise<void>((resolve) => {
+        resolveApplied = resolve;
+      });
+      const stopped = new Promise<never>((_resolve, reject) => {
+        rejectStopped = reject;
+      });
+      const resetSubscription = ref.on('context.reset', () => {
+        resolveApplied();
+      });
+      const stopSubscription = ref.subscribe((snapshot) => {
+        if (snapshot.status === 'stopped') {
+          rejectStopped(new Error('Machine stopped while resetting history'));
+        }
+      });
+      const completion = Promise.race([applied, stopped]);
+      try {
+        await store.reset(next);
+        await completion;
+      } finally {
+        resetSubscription.unsubscribe();
+        stopSubscription.unsubscribe();
+      }
     },
     resetJournal: (journal) => {
       currentJournal = journal;

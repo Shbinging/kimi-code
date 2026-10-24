@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { createDecorator } from '#/_base/di/instantiation';
 import { type AgentTool } from '#/tool/toolContract';
 
-export const DEFAULT_TIMEOUT_S = 5;
+export const DEFAULT_TIMEOUT_S = 15;
 export const MAX_TIMEOUT_S = 5 * 60;
 export const DEFAULT_BACKGROUND_TIMEOUT_S = 10 * 60;
 export const MAX_BACKGROUND_TIMEOUT_S = 24 * 60 * 60;
@@ -29,9 +29,8 @@ export const BashInputSchema = z
       .number()
       .int()
       .positive()
-      .default(DEFAULT_TIMEOUT_S)
       .describe(
-        `Optional timeout in seconds for the command to execute. Foreground default ${String(DEFAULT_TIMEOUT_S)}s, max ${String(MAX_TIMEOUT_S)}s. Background default ${String(DEFAULT_BACKGROUND_TIMEOUT_S)}s, max ${String(MAX_BACKGROUND_TIMEOUT_S)}s. Ignored for background commands when disable_timeout=true.`,
+        `Optional total command timeout in seconds, including foreground and background execution. Max ${String(MAX_TIMEOUT_S)}s for commands started in the foreground and ${String(MAX_BACKGROUND_TIMEOUT_S)}s for commands started in the background. Background default ${String(DEFAULT_BACKGROUND_TIMEOUT_S)}s. Ignored for background commands when disable_timeout=true.`,
       )
       .optional(),
     description: z
