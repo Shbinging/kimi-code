@@ -675,8 +675,9 @@ function context(
   args: BashInput,
   signal = new AbortController().signal,
   onForegroundTaskStart?: (taskId: string) => void,
+  signals?: Pick<ExecutableToolContext, 'steerSignal' | 'steerInterruptSignal'>,
 ) {
-  return { turnId: 0, toolCallId: 'call_bash', args, signal, onForegroundTaskStart };
+  return { turnId: 0, toolCallId: 'call_bash', args, signal, onForegroundTaskStart, ...signals };
 }
 
 function isPromiseLike(value: ToolExecution | Promise<ToolExecution>): value is Promise<ToolExecution> {
@@ -819,7 +820,7 @@ describe('BashTool', () => {
     const properties = (tool.parameters as { properties: Record<string, { default?: number }> })
       .properties;
 
-    expect(properties['timeout']?.default).toBe(60);
+    expect(properties['timeout']?.default).toBe(5);
   });
 
   it('renders the available commands section and the background-task panel hint', () => {
@@ -1139,6 +1140,50 @@ describe('BashTool', () => {
     expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
     expect(result).toMatchObject({ isError: true });
     expect(result.output).toContain('Interrupted by user');
+  });
+
+  it('detaches on steer interrupt without killing the process', async () => {
+    let resolveWait: (code: number) => void = () => {};
+    const waitPromise = new Promise<number>((resolve) => {
+      resolveWait = resolve;
+    });
+    const proc = processWithOutput({
+      wait: async () => waitPromise,
+      kill: async () => {
+        resolveWait(143);
+      },
+    });
+    const { runner } = createTestRunner(proc);
+    const { service, tasks } = createFakeTaskService();
+    const tool = bashTool(runner, createTestEnv(), createTestCtx(), service);
+    const controller = new AbortController();
+    const steer = new AbortController();
+    const steerInterrupt = new AbortController();
+
+    const running = executeTool(
+      tool,
+      context({ command: 'sleep 10' }, controller.signal, undefined, {
+        steerSignal: steer.signal,
+        steerInterruptSignal: steerInterrupt.signal,
+      }),
+    );
+    await vi.waitFor(() => {
+      expect(proc.stdin.end).toHaveBeenCalled();
+    });
+    const taskId = [...tasks.keys()][0]!;
+    steer.abort();
+    await Promise.resolve();
+    expect(service.getTask(taskId)?.detached).toBe(false);
+
+    steerInterrupt.abort();
+    const result = await running;
+    controller.abort();
+
+    expect(result.output).toContain('detached_by_user: true');
+    expect(service.getTask(taskId)).toMatchObject({ status: 'running', detached: true });
+    expect(proc.kill).not.toHaveBeenCalled();
+    resolveWait(0);
+    await expect(service.wait(taskId)).resolves.toMatchObject({ status: 'completed' });
   });
 
   it('caps retained output and reports the true total via spill when stdout exceeds the retention cap', async () => {

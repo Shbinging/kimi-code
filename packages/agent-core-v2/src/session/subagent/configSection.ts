@@ -24,6 +24,7 @@ export const SECONDARY_MODEL_SECTION = 'secondaryModel';
 
 export const SubagentConfigSchema = z.object({
   timeoutMs: z.number().int().min(0).optional(),
+  autoBackgroundAfterMs: z.number().int().min(0).optional(),
 });
 
 export type SubagentConfig = z.infer<typeof SubagentConfigSchema>;
@@ -48,6 +49,7 @@ export const SecondaryModelConfigSchema = z.object({
 export type SecondaryModelConfig = z.infer<typeof SecondaryModelConfigSchema>;
 
 export const DEFAULT_SUBAGENT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+export const DEFAULT_SUBAGENT_AUTO_BACKGROUND_AFTER_MS = 5000;
 
 export const SUBAGENT_TIMEOUT_ENV = 'KIMI_SUBAGENT_TIMEOUT_MS';
 
@@ -66,7 +68,10 @@ export const subagentEnvBindings: EnvBindings<SubagentConfig> = envBindings(
 export const stripSubagentEnv = stripEnvBoundFields(subagentEnvBindings);
 
 registerConfigSection(SUBAGENT_SECTION, SubagentConfigSchema, {
-  defaultValue: { timeoutMs: DEFAULT_SUBAGENT_TIMEOUT_MS },
+  defaultValue: {
+    timeoutMs: DEFAULT_SUBAGENT_TIMEOUT_MS,
+    autoBackgroundAfterMs: DEFAULT_SUBAGENT_AUTO_BACKGROUND_AFTER_MS,
+  },
   env: subagentEnvBindings,
   stripEnv: stripSubagentEnv,
 });
@@ -77,6 +82,13 @@ export function resolveSubagentTimeoutMs(config: IConfigService): number {
   return (
     config.get<SubagentConfig | undefined>(SUBAGENT_SECTION)?.timeoutMs ??
     DEFAULT_SUBAGENT_TIMEOUT_MS
+  );
+}
+
+export function resolveSubagentAutoBackgroundAfterMs(config: IConfigService): number {
+  return (
+    config.get<SubagentConfig | undefined>(SUBAGENT_SECTION)?.autoBackgroundAfterMs ??
+    DEFAULT_SUBAGENT_AUTO_BACKGROUND_AFTER_MS
   );
 }
 

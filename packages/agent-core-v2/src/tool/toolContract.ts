@@ -72,6 +72,7 @@ export interface ExecutableToolContext {
   readonly metadata?: unknown;
   readonly signal: AbortSignal;
   readonly steerSignal?: AbortSignal;
+  readonly steerInterruptSignal?: AbortSignal;
   readonly onUpdate?: ((update: ToolUpdate) => void) | undefined;
   readonly onForegroundTaskStart?: ((taskId: string) => void) | undefined;
 }

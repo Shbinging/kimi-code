@@ -249,6 +249,41 @@ describe('prompt queue', () => {
     await loop.settled();
   });
 
+  it('interrupts the current step and resumes the same turn with steered input', async () => {
+    setup();
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let first = true;
+    loop.hooks.onWillBeginStep.register('test-interrupt-step', async (hookCtx, next) => {
+      if (first) {
+        first = false;
+        markStarted();
+        await new Promise<void>((_resolve, reject) => {
+          hookCtx.signal.addEventListener('abort', () => reject(hookCtx.signal.reason), { once: true });
+        });
+      }
+      await next();
+    });
+    ctx.mockNextResponse({ type: 'text', text: 'after steer' });
+
+    const active = await enqueue(loop, { message: message('active') });
+    await started;
+    const turn = await active.launched;
+    const queued = await enqueue(loop, { message: message('redirect') });
+    await loop.steer([queued.id]);
+    await loop.settled();
+
+    expect(turn?.id).toBe(0);
+    await expect(turn?.result).resolves.toMatchObject({ type: 'completed' });
+    expect(ctx.llmCalls).toHaveLength(1);
+    expect(ctx.llmCalls[0]?.history.at(-1)).toMatchObject({
+      role: 'user',
+      content: [{ type: 'text', text: 'active\n\nredirect' }],
+    });
+  });
+
   it('reserves a messageId on prompt.steered and publishes turn.steer at materialize', async () => {
     setup();
     const hold = holdNextStep();
@@ -306,7 +341,7 @@ describe('prompt queue', () => {
     expect(PromptSteered.schema.parse(steered[0]).promptIds).toEqual([one.id, two.id]);
     hold.release();
     await loop.settled();
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
     const merged = ctx
       .get(IAgentContextMemoryService)
       .get()
@@ -341,7 +376,7 @@ describe('prompt queue', () => {
     expect(events).toHaveLength(0);
     hold.release();
     await loop.settled();
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
     const merged = ctx
       .get(IAgentContextMemoryService)
       .get()

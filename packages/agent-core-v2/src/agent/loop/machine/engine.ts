@@ -129,6 +129,7 @@ export interface CreateMachineEngineOptions {
   readonly source?: () => AgentLLMRequestSource | undefined;
   readonly toolTurnId?: () => number | undefined;
   readonly steerSignal?: () => AbortSignal | undefined;
+  readonly steerInterruptSignal?: () => AbortSignal | undefined;
   readonly gate?: (signal: AbortSignal) => Promise<MachineRequesterGateDecision>;
   readonly promptGate?: PromptGate;
   readonly onTrace?: (trace: LLMRequestTrace) => void;
@@ -295,6 +296,7 @@ export function machineEngineAttachBundle(options: CreateMachineEngineOptions): 
     toolInfos: options.toolInfos,
     turnId: () => options.toolTurnId?.() ?? 0,
     steerSignal: options.steerSignal,
+    steerInterruptSignal: options.steerInterruptSignal,
     trace: options.trace,
     onToolCall: (payload) => {
       publish({

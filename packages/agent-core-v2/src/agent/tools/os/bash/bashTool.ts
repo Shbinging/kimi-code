@@ -149,8 +149,8 @@ export class BashTool implements IBashTool {
       },
       approvalRule: literalRulePattern(this.name, args.command),
       matchesRule: (ruleArgs) => matchesGlobRuleSubject(ruleArgs, args.command),
-      execute: ({ signal, onUpdate, onForegroundTaskStart, toolCallId }) =>
-        this.execution(args, signal, toolCallId, onUpdate, onForegroundTaskStart),
+      execute: ({ signal, steerInterruptSignal, onUpdate, onForegroundTaskStart, toolCallId }) =>
+        this.execution(args, signal, toolCallId, steerInterruptSignal, onUpdate, onForegroundTaskStart),
     };
   }
 
@@ -176,6 +176,7 @@ export class BashTool implements IBashTool {
     args: BashInput,
     signal: AbortSignal,
     toolCallId: string,
+    steerInterruptSignal?: AbortSignal,
     onUpdate?: (update: ToolUpdate) => void,
     onForegroundTaskStart?: (taskId: string) => void,
   ): Promise<ExecutableToolResult> {
@@ -183,7 +184,13 @@ export class BashTool implements IBashTool {
     if (validationError !== undefined) return validationError;
 
     const startsInBackground = args.run_in_background === true;
-    const foregroundTimeoutMs = normalizeTimeoutMs(args.timeout, false);
+    const foregroundTimeoutMs =
+      Math.min(
+        args.timeout ??
+          resolveAgentTaskConfig(this.config)?.bashForegroundTimeoutS ??
+          DEFAULT_TIMEOUT_S,
+        MAX_TIMEOUT_S,
+      ) * MS_PER_SECOND;
     const lease = this.runtime.acquire(['process']);
     const view = new RuntimeWorkspaceView(lease.runtime, this.workspaceCtx);
     const env = lease.runtime.environment;
@@ -260,6 +267,11 @@ export class BashTool implements IBashTool {
       });
     }
 
+    const detachOnSteerInterrupt = (): void => {
+      this.tasks.detach(taskId);
+    };
+    if (steerInterruptSignal?.aborted) detachOnSteerInterrupt();
+    else steerInterruptSignal?.addEventListener('abort', detachOnSteerInterrupt, { once: true });
     try {
       const release = await this.tasks.waitForForegroundRelease(taskId);
       if (release === 'detached' || release === 'timeout_detached') {
@@ -286,6 +298,7 @@ export class BashTool implements IBashTool {
 
       return await this.foregroundCompletionResult(taskId, proc, builder, foregroundTimeoutMs);
     } finally {
+      steerInterruptSignal?.removeEventListener('abort', detachOnSteerInterrupt);
       collectForegroundOutput = false;
     }
   }

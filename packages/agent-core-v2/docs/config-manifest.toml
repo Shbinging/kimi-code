@@ -59,6 +59,7 @@
 # max_running_tasks: integer
 # keep_alive_on_exit: boolean
 # bash_auto_background_on_timeout: boolean
+# bash_foreground_timeout_s: integer
 # bash_task_timeout_s: integer
 # kill_grace_period_ms: integer
 # print_wait_ceiling_s: integer
@@ -426,6 +427,7 @@ merge_all_available_skills = true
 
 [subagent]
 timeout_ms = 7200000
+auto_background_after_ms = 5000
 
 # ##########################################################################
 # swarm
@@ -457,6 +459,7 @@ timeout_ms = 7200000
 # max_running_tasks: integer
 # keep_alive_on_exit: boolean
 # bash_auto_background_on_timeout: boolean
+# bash_foreground_timeout_s: integer
 # bash_task_timeout_s: integer
 # kill_grace_period_ms: integer
 # print_wait_ceiling_s: integer

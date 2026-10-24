@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { createDecorator } from '#/_base/di/instantiation';
 import { type AgentTool } from '#/tool/toolContract';
 
-export const DEFAULT_TIMEOUT_S = 60;
+export const DEFAULT_TIMEOUT_S = 5;
 export const MAX_TIMEOUT_S = 5 * 60;
 export const DEFAULT_BACKGROUND_TIMEOUT_S = 10 * 60;
 export const MAX_BACKGROUND_TIMEOUT_S = 24 * 60 * 60;

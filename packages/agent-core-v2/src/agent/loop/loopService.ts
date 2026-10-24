@@ -218,6 +218,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       trace: () => this.activeRequestTrace,
       toolTurnId: () => this.active?.id,
       steerSignal: () => this.active?.steerController.signal,
+      steerInterruptSignal: () => this.active?.steerInterruptController.signal,
       source: () =>
         this.active === undefined
           ? undefined
@@ -361,13 +362,18 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     } else {
       this.pendingSubmissions.push(entry);
     }
+    const active = this.active;
     if (
       options?.steerIfActive === true &&
-      this.active !== undefined &&
-      this.active.prompt.tracked &&
+      active !== undefined &&
+      active.prompt.tracked &&
       this.engine !== undefined
     ) {
       this.machineEngine().steer(id);
+      if (origin.kind === 'user' && !active.steerInterruptController.signal.aborted) {
+        active.steerInterruptController.abort(abortError('Steered by new input'));
+        this.machineEngine().abort();
+      }
     }
     return { id };
   }
@@ -398,6 +404,10 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       throw new Error2(ErrorCodes.PROMPT_NOT_FOUND, 'one or more prompts are no longer pending');
     }
     engine.steer(promptIds);
+    if (!active.steerInterruptController.signal.aborted) {
+      active.steerInterruptController.abort(abortError('Steered by new input'));
+      engine.abort();
+    }
   }
 
   promptHandle(id: string): PromptHandle | undefined {
@@ -1002,6 +1012,9 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
     if (turn.steerController.signal.aborted) {
       turn.steerController = new AbortController();
     }
+    if (turn.steerInterruptController.signal.aborted) {
+      turn.steerInterruptController = new AbortController();
+    }
     if (turn.toolStopRequested && consumed.live === 0) return { type: 'fail' };
     const stepOrdinal = Math.max(this.engine?.currentStep() ?? 0, turn.steps + 1);
     const maxSteps = this.config.get<LoopControl>(LOOP_CONTROL_SECTION)?.maxStepsPerTurn;
@@ -1233,6 +1246,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
       prompt,
       controller,
       steerController: new AbortController(),
+      steerInterruptController: new AbortController(),
       turn,
       ready,
       result,
@@ -1965,6 +1979,30 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
   ): Promise<void> {
     if (this.active !== turn) return;
     if (
+      outcome.outcome === 'aborted' &&
+      turn.steerInterruptController.signal.aborted &&
+      !turn.controller.signal.aborted &&
+      this.hasLiveNudge()
+    ) {
+      this.interruptMachineRunForCancel(turn, turn.steerInterruptController.signal.reason);
+      if (!turn.readyResolved) {
+        turn.readyResolved = true;
+        turn.ready.resolve();
+      }
+      turn.abortReason = undefined;
+      turn.failedStep = undefined;
+      await this.machineEngine().resetHistory(historyFromContext(this.context.get()));
+      this.machineEngine().pause();
+      for (const nudge of this.nudges.slice(this.nudgeCursor)) {
+        if (!nudge.dropped && !nudge.consumed && nudge.contextMessage !== undefined) {
+          nudge.sentToMachine = false;
+        }
+      }
+      this.drainPendingToMachine();
+      this.machineEngine().resume();
+      return;
+    }
+    if (
       turn.failedStep !== undefined &&
       turn.abortReason === undefined &&
       !turn.controller.signal.aborted
@@ -2324,6 +2362,7 @@ interface ActiveTurn {
   readonly prompt: ActivePrompt;
   readonly controller: AbortController;
   steerController: AbortController;
+  steerInterruptController: AbortController;
   readonly turn: MutableTurn;
   readonly ready: ReturnType<typeof createControlledPromise<void>>;
   readonly result: ReturnType<typeof createControlledPromise<TurnResult>>;

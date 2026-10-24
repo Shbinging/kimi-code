@@ -73,6 +73,7 @@ import {
   exposesSubagentModelChoice,
   formatSubagentTimeoutDescription,
   isSubagentModelForced,
+  resolveSubagentAutoBackgroundAfterMs,
   resolveSubagentModelPool,
   resolveSubagentTimeoutMs,
   stripSubagentForkParameter,
@@ -456,7 +457,7 @@ export class SubagentTool implements ISubagentTool {
 
   private async execution(
     args: SubagentToolInput,
-    { toolCallId, signal }: ExecutableToolContext,
+    { toolCallId, signal, steerInterruptSignal }: ExecutableToolContext,
   ): Promise<ExecutableToolResult> {
     try {
       signal.throwIfAborted();
@@ -484,6 +485,12 @@ export class SubagentTool implements ISubagentTool {
         return { output: BACKGROUND_AGENT_UNAVAILABLE, isError: true };
       }
       const timeoutMs = resolveSubagentTimeoutMs(this.config);
+      const autoBackgroundAfterMs = resolveSubagentAutoBackgroundAfterMs(this.config);
+      const autoBackgroundOnTimeout =
+        !runInBackground &&
+        allowBackground &&
+        autoBackgroundAfterMs > 0 &&
+        (timeoutMs === 0 || autoBackgroundAfterMs < timeoutMs);
 
       const controller = new AbortController();
       const abortBeforeRegister = (): void => {
@@ -513,7 +520,13 @@ export class SubagentTool implements ISubagentTool {
       try {
         const registerOptions: RegisterAgentTaskOptions = {
           detached: runInBackground,
-          timeoutMs,
+          timeoutMs: autoBackgroundOnTimeout ? autoBackgroundAfterMs : timeoutMs,
+          detachTimeoutMs: autoBackgroundOnTimeout
+            ? timeoutMs === 0
+              ? 0
+              : timeoutMs - autoBackgroundAfterMs
+            : undefined,
+          autoBackgroundOnTimeout,
           signal: runInBackground ? undefined : signal,
         };
         taskId = this.tasks.registerTask(
@@ -564,13 +577,28 @@ export class SubagentTool implements ISubagentTool {
         };
       }
 
-      const release = await this.tasks.waitForForegroundRelease(taskId);
-      if (release === 'detached') {
-        return {
-          output: formatBackgroundAgentResult(taskId, handle, args.description, allowBackground, true),
-        };
+      const detachOnSteerInterrupt = (): void => {
+        this.tasks.detach(taskId);
+      };
+      if (steerInterruptSignal?.aborted) detachOnSteerInterrupt();
+      else steerInterruptSignal?.addEventListener('abort', detachOnSteerInterrupt, { once: true });
+      try {
+        const release = await this.tasks.waitForForegroundRelease(taskId);
+        if (release === 'detached' || release === 'timeout_detached') {
+          return {
+            output: formatBackgroundAgentResult(
+              taskId,
+              handle,
+              args.description,
+              allowBackground,
+              release === 'detached',
+            ),
+          };
+        }
+        return await this.formatForegroundResult(taskId, handle, timeoutMs);
+      } finally {
+        steerInterruptSignal?.removeEventListener('abort', detachOnSteerInterrupt);
       }
-      return await this.formatForegroundResult(taskId, handle, timeoutMs);
     } catch (error) {
       return { output: `subagent error: ${launchErrorMessage(error, signal)}`, isError: true };
     }
